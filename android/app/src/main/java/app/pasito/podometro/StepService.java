@@ -98,13 +98,35 @@ public class StepService extends Service implements SensorEventListener {
 
         long wall = System.currentTimeMillis() - (SystemClock.elapsedRealtimeNanos() - e.timestamp) / 1_000_000L;
         long minute = wall / 60_000L;
-        StepStore.get(this).add(minute, delta);
+        store(minute, delta);
 
         long nowMin = System.currentTimeMillis() / 60_000L;
         if (nowMin != lastNotifMinute) {
             lastNotifMinute = nowMin;
             NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
             if (nm != null) nm.notify(NOTIF_ID, buildNotification());
+        }
+    }
+
+    static final int MAX_PER_MIN = 250;   // el servidor no acepta más pasos por minuto
+    static final int PACE = 110;          // ritmo típico al caminar, para repartir pasos atrasados
+
+    /**
+     * Guarda `delta` pasos que terminan en `minute`. Si llegan de golpe tras una pausa larga
+     * (p. ej. Android detuvo el servicio), se reparten en los minutos anteriores a un ritmo de
+     * caminata normal en lugar de amontonarse en un solo minuto.
+     */
+    private void store(long minute, int delta) {
+        StepStore db = StepStore.get(this);
+        if (delta <= MAX_PER_MIN) { db.add(minute, delta); return; }
+        // Nadie da tantos pasos en un minuto: vienen de los minutos anteriores.
+        long mins = Math.min(1440, (delta + PACE - 1) / PACE);
+        int per = (int) Math.min(MAX_PER_MIN, (delta + mins - 1) / mins);
+        int left = delta;
+        for (long m = minute; m > minute - mins && left > 0; m--) {
+            int v = Math.min(per, left);
+            db.add(m, v);
+            left -= v;
         }
     }
 

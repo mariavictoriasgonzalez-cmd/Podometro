@@ -23,7 +23,9 @@
 
   // ================= Estado =================
   const STORE = 'pasito.v1';
-  const WALK_MIN = 15;   // pasos/minuto a partir de los que un minuto cuenta como "caminando"
+  const WALK_MIN = 15;
+  const MAX_PER_MIN = 250;   // límite realista de pasos por minuto (el servidor aplica el mismo)
+  const MAX_MANUAL = 50000;  // pasos máximos en un registro a mano   // pasos/minuto a partir de los que un minuto cuenta como "caminando"
   const defaults = () => ({
     settings: {
       name: '',
@@ -367,7 +369,8 @@
       const since = S.lastSync ? S.lastSync - 120 : 0;
       const res = await Native.getBuckets({ since });
       let changed = false;
-      for (const [m, steps] of res.buckets || []) {
+      for (const [m, raw] of res.buckets || []) {
+        const steps = Math.min(raw, MAX_PER_MIN);
         const d = new Date(m * 60000), k = keyOf(d), mod = d.getHours() * 60 + d.getMinutes();
         const day = ensureDay(k);
         if (day.auto[mod] !== steps) { day.auto[mod] = steps; changed = true; markDirty(k); }
@@ -507,6 +510,7 @@
     pushing = true; cloudState = 'syncing';
     try {
       const keys = Object.keys(S.dirty || {});
+      const needBadges = keys.length > 0 || S.badgesDirty || S.settingsDirty;
       for (let i = 0; i < keys.length; i += 100) {
         const chunk = keys.slice(i, i + 100);
         const rows = chunk.map(k => ({
@@ -523,9 +527,10 @@
       const { error: pe } = await sb.from('profiles').update(prof).eq('id', user.id);
       if (pe) throw pe;
       S.settingsDirty = false; S.consentDirty = false;
-      if (S.badgesDirty) {
-        const rows = Object.entries(S.badges).map(([id, b]) => ({ user_id: user.id, badge_id: id, unlocked_at: new Date(b.at).toISOString(), count: b.count || 1 }));
-        if (rows.length) { const { error } = await sb.from('badges').upsert(rows, { onConflict: 'user_id,badge_id' }); if (error) throw error; }
+      if (needBadges) {
+        // Las insignias las concede el servidor a partir de los pasos guardados.
+        const { error } = await sb.rpc('refresh_badges');
+        if (error) throw error;
         S.badgesDirty = false;
       }
       S.lastPush = Date.now(); save();
@@ -625,7 +630,7 @@
           <div class="user-pic">${avatarOf(u)}</div>
           <div class="item__main"><div class="item__title">${esc(u.full_name || u.email || 'Sin nombre')}</div>
             <div class="item__sub">${esc(u.email || '')}</div>
-            <div class="item__sub">Activo ${ago(u.last_seen_at)} · ${u.badges} insignias</div></div>
+            <div class="item__sub">Activo ${ago(u.last_seen_at)} · ${u.badges} insignias${Number(u.manual_steps_30d) > 0 ? ` · <span class="manual-tag">✍️ ${Math.round(100 * u.manual_steps_30d / Math.max(1, u.steps_30d))}% a mano</span>` : ''}</div></div>
           <div class="item__end num">${fmtK(Number(u.steps_7d) / 7)}<small>pasos/día</small></div>
         </button>`).join('') || '<div class="empty">Todavía no hay usuarios.</div>'}</div>
       <p class="sheet__sub" style="margin-top:14px;font-size:12px">Para descargar todos los datos en Excel/CSV: panel de Supabase → Table Editor → day_steps → Export.</p>
@@ -636,12 +641,13 @@
   async function adminUser(u) {
     if (!u) return;
     const since = keyOf(addDays(new Date(), -29));
-    const { data } = await sb.from('day_steps').select('day, steps, active_seconds').eq('user_id', u.user_id).gte('day', since).order('day');
+    const { data } = await sb.from('day_steps').select('day, steps, auto_steps, manual_steps, active_seconds').eq('user_id', u.user_id).gte('day', since).order('day');
     const byDay = Object.fromEntries((data || []).map(r => [r.day, r]));
     const days = [];
     for (let i = 29; i >= 0; i--) { const d = addDays(new Date(), -i), k = keyOf(d); days.push({ d, k, steps: byDay[k] ? byDay[k].steps : 0, secs: byDay[k] ? byDay[k].active_seconds : 0 }); }
     const goal = u.daily_goal || 8000;
     const sum = days.reduce((a, x) => a + x.steps, 0), secs = days.reduce((a, x) => a + x.secs, 0);
+    const manual = (data || []).reduce((a, r) => a + (r.manual_steps || 0), 0);
     openSheet(`
       <h2 class="sheet__title">${esc(u.full_name || u.email)}</h2>
       <p class="sheet__sub">${esc(u.email || '')} · desde ${new Date(u.created_at).toLocaleDateString('es-ES', { day: 'numeric', month: 'long', year: 'numeric' })}</p>
@@ -649,6 +655,8 @@
       <div class="kpis" style="margin-top:12px">
         <div class="kpi"><div class="kpi__lbl">Media diaria</div><div class="kpi__val num">${fmt(sum / 30)}</div><div class="kpi__sub">objetivo ${fmtK(goal)}</div></div>
         <div class="kpi"><div class="kpi__lbl">Tiempo caminando</div><div class="kpi__val num">${fmtDur(secs / 30)}</div><div class="kpi__sub">al día</div></div>
+        <div class="kpi"><div class="kpi__lbl">👟 Contados por el móvil</div><div class="kpi__val num">${fmtK(sum - manual)}</div><div class="kpi__sub">últimos 30 días</div></div>
+        <div class="kpi"><div class="kpi__lbl">✍️ Añadidos a mano</div><div class="kpi__val num">${fmtK(manual)}</div><div class="kpi__sub">${sum ? Math.round(100 * manual / sum) : 0}% del total</div></div>
         <div class="kpi"><div class="kpi__lbl">Total histórico</div><div class="kpi__val num">${fmtK(Number(u.total_steps))}</div><div class="kpi__sub">${u.days_active} días con pasos</div></div>
         <div class="kpi"><div class="kpi__lbl">Mejor día</div><div class="kpi__val num">${fmtK(u.best_day)}</div><div class="kpi__sub">${u.badges} insignias</div></div>
       </div>
@@ -1109,7 +1117,7 @@
       <h2 class="sheet__title">${edit ? 'Editar registro' : 'Añadir pasos'}</h2>
       <p class="sheet__sub">${edit ? 'Corrige los pasos o la duración.' : '¿Caminaste sin la app? Apúntalo aquí (por ejemplo, desde el contador de tu móvil o reloj).'}</p>
       <div class="field"><label for="f-steps">Pasos</label>
-        <div class="stepper"><button type="button" data-d="-500">−</button><input class="input num" id="f-steps" type="number" inputmode="numeric" min="0" max="200000" value="${p.steps ?? 1000}"><button type="button" data-d="500">+</button></div>
+        <div class="stepper"><button type="button" data-d="-500">−</button><input class="input num" id="f-steps" type="number" inputmode="numeric" min="0" max="${MAX_MANUAL}" value="${p.steps ?? 1000}"><button type="button" data-d="500">+</button></div>
       </div>
       <div class="chips" style="margin:-4px 0 14px">${[1000, 2500, 5000, 8000, 10000].map(v => `<button class="chip" type="button" data-v="${v}">${fmtK(v)}</button>`).join('')}</div>
       <div class="field-row">
@@ -1129,6 +1137,7 @@
         const [hh, mm] = ($('#f-time', sh).value || '12:00').split(':').map(Number);
         const date = parseKey($('#f-date', sh).value || todayKey()); date.setHours(hh, mm, 0, 0);
         if (steps <= 0) { toast('Introduce un número de pasos'); return; }
+        if (steps > MAX_MANUAL) { toast(`Como máximo ${fmt(MAX_MANUAL)} pasos por registro`); return; }
         if (edit) removeSession(keyOf(new Date(p.start)), p.id);
         addSession(keyOf(date), { id: p.id || 'm' + Date.now(), start: date.getTime(), end: date.getTime() + mins * 60000, steps, seconds: mins * 60, source: p.source || 'manual' });
         save(); closeSheet(); render(); toast(edit ? 'Registro actualizado' : `+${fmt(steps)} pasos añadidos 🎉`); checkBadges();
