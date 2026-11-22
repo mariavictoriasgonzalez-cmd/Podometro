@@ -1,43 +1,57 @@
 # 👟 Pasito · Podómetro
 
-App web (PWA) para registrar tus pasos del día a día, con historial, estadísticas, una mascota que te anima (**Pipo**) e insignias por hitos.
+App de Android que cuenta tus pasos sola, en segundo plano, sin pulsar nada. Guarda el historial y las estadísticas, y tiene una mascota (a elegir entre cinco) que te anima. Tus hitos te dan insignias.
 
-## Qué incluye
+## Qué hace
 
-- **Hoy**: anillo de progreso hacia tu objetivo diario, pasos, tiempo activo, km, kcal y ritmo (pasos/min). Pipo cambia de humor y de mensaje según cómo vas.
-- **Caminata en directo**: cuenta los pasos con el acelerómetro del móvil, cronometra el tiempo, permite pausar y mantiene la pantalla encendida.
-- **Añadir a mano**: apunta pasos y duración de cualquier día (por ejemplo, copiados del contador del móvil o del reloj). Se pueden editar y borrar.
-- **Historial**: calendario de calor por mes y lista de días agrupados por semanas, con detalle de cada caminata.
-- **Estadísticas** (7 días / 30 días / 3 meses): gráfico de pasos con línea de objetivo, comparación con el periodo anterior, total, tiempo activo, ritmo medio y km/h, mejor día, día de la semana favorito, franja horaria en la que más caminas y récords personales.
-- **Logros**: niveles (Paseante → Leyenda) e insignias:
-  - Hitos diarios (1k, 5k, 8k, 10k, 15k, 20k): cuentan cuántas veces los consigues.
-  - Retos semanales (35k, 50k, 70k, 100k de lunes a domingo).
-  - Pasos acumulados (10k → 1M).
-  - Rachas (3, 7, 14 y 30 días seguidos cumpliendo el objetivo).
-  - Especiales: Primer paso, Madrugador, Noctámbulo, Gran paseo, Finde activo, Doble o nada.
-  - **Todos los hitos se pueden ajustar** en Ajustes: añadir o quitar los que quieras.
-- **Ajustes**: objetivo diario y semanal, nombre y color de la mascota, zancada y peso (para km y kcal), sensibilidad del sensor, tema claro u oscuro, exportar e importar copia de seguridad y datos de ejemplo.
+- **Cuenta los pasos en segundo plano.** Usa el contador de pasos que lleva el propio móvil, que gasta muy poca batería. Funciona con la app cerrada y vuelve a arrancar sola si reinicias el teléfono. Una notificación discreta muestra los pasos de hoy.
+- **Tiempo caminando y caminatas automáticas.** Los pasos se guardan minuto a minuto. Un minuto con 15 pasos o más cuenta como "caminando". Si caminas 5 minutos seguidos o más, aparece una caminata con su hora, duración y ritmo. No hay cronómetro que pulsar.
+- **Hoy:** anillo de progreso, pasos, tiempo caminando, km, kcal y ritmo; gráfico hora a hora; semana, racha, total y próxima insignia.
+- **Historial:** calendario de calor por mes y lista de días agrupados por semanas.
+- **Estadísticas** (7 días, 30 días o 3 meses): pasos por día con la línea del objetivo, comparación con el periodo anterior, día favorito de la semana, franja horaria y récords.
+- **Logros:** niveles e insignias por hitos diarios, retos semanales, pasos acumulados, rachas y logros especiales. **Todos los hitos se pueden ajustar.**
+- **Mascotas:** Pipo, Misi (gata), Toby (perro), Copo (pingüino) y Rex (dino). Se les puede cambiar el nombre y el color. Cambian de humor según tu día: duermen, te saludan, caminan contigo y celebran tus objetivos.
+- **Añadir pasos a mano** para corregir o completar un día.
 
-Los datos se guardan solo en el dispositivo (localStorage). Funciona sin conexión.
+Los datos se guardan solo en el móvil. En Ajustes se puede exportar e importar una copia de seguridad.
 
-## Probarla
+## Instalar en Android
+
+1. Copia `Pasito.apk` al móvil y ábrelo. Android pedirá permiso para instalar apps de origen desconocido.
+2. Al abrir Pasito, acepta el permiso de **actividad física** y el de notificaciones.
+3. Recomendado: en Ajustes de Pasito, pulsa **Quitar restricción de batería**. Algunos móviles (Xiaomi, Huawei, Samsung…) cierran las apps en segundo plano. En ese caso, busca también "Inicio automático" o "Apps sin restricciones" en los ajustes del teléfono.
+
+El contador empieza a contar desde que lo activas. Los pasos anteriores a instalar la app no se pueden recuperar.
+
+## Compilar
+
+Hace falta Node 20 o más, JDK 21 y el Android SDK (plataforma 36).
 
 ```bash
-python3 -m http.server 8000
-# abre http://localhost:8000
+npm install
+npx cap sync android
+cd android && ./gradlew assembleRelease   # → app/build/outputs/apk/release/app-release.apk
 ```
 
-Para usarla en el móvil hay que servirla por **HTTPS** (el sensor de movimiento lo exige), por ejemplo activando GitHub Pages en el repositorio. Después, desde el navegador: «Añadir a pantalla de inicio».
+Para firmar la versión release, crea `android/keystore.properties`. Ninguno de estos ficheros se sube al repositorio:
 
-### Limitaciones del contador
+```
+storeFile=../pasito-release.jks
+storePassword=…
+keyAlias=pasito
+keyPassword=…
+```
 
-Un navegador solo puede leer el acelerómetro con la app abierta y la pantalla encendida, así que los pasos se cuentan durante las caminatas que inicias. Para los pasos del resto del día, usa «Añadir». Leer automáticamente Apple Salud o Google Health Connect requeriría convertirla en app nativa.
+**Guarda bien el `.jks` y su contraseña.** Android solo deja actualizar la app si la nueva versión está firmada con la misma clave. Sin ella habría que desinstalar, y se perderían los datos (exporta antes una copia).
 
-## Archivos
+Para probar la interfaz en el navegador, sin contador automático: `npm run serve` y abre http://localhost:8000.
 
-| Archivo | Qué es |
+## Estructura
+
+| Ruta | Qué es |
 |---|---|
-| `index.html` | Estructura y barra de pestañas |
-| `styles.css` | Diseño (tema claro y oscuro) |
-| `app.js` | Toda la lógica: sensor, datos, vistas, insignias y mascota |
-| `sw.js`, `manifest.webmanifest`, `icons/` | Instalación como app y modo sin conexión |
+| `www/` | La app: `index.html`, `styles.css` y `app.js` (vistas, insignias, mascotas, estadísticas) |
+| `android/app/src/main/java/app/pasito/podometro/StepService.java` | Servicio en segundo plano que lee el contador de pasos del móvil |
+| `…/StepStore.java` | Base de datos de pasos por minuto |
+| `…/PasosPlugin.java` | Puente entre la app y el contador (permisos, sincronización, batería) |
+| `…/BootReceiver.java` | Vuelve a arrancar el contador al encender el móvil |

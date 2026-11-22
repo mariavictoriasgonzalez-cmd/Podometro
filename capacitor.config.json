@@ -1,0 +1,6 @@
+{
+  "appId": "app.pasito.podometro",
+  "appName": "Pasito",
+  "webDir": "www",
+  "android": { "backgroundColor": "#FFF6EE" }
+}

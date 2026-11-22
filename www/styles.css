@@ -540,3 +540,39 @@ svg { display: block; }
 @media (min-width: 420px) {
   .badge-grid { grid-template-columns: repeat(3, 1fr); }
 }
+
+/* ============ v2: avisos, avatares, contador ============ */
+.notice {
+  display: flex; gap: 12px; align-items: flex-start; position: relative;
+  background: var(--surface); border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 14px 40px 14px 14px; margin-bottom: 12px; border: 1.5px solid var(--line);
+  animation: fadeUp .3s ease both;
+}
+.notice.is-cta { background: linear-gradient(135deg, var(--primary-soft), var(--surface)); border-color: transparent; padding-right: 14px; }
+.notice.is-warn { border-color: #F5B301; padding-right: 14px; }
+.notice__icon { font-size: 24px; line-height: 1; flex: 0 0 auto; }
+.notice__txt { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+.notice__txt strong { font-weight: 900; font-size: 15px; }
+.notice__txt span { color: var(--ink-2); font-weight: 700; font-size: 13px; line-height: 1.4; }
+.notice__txt .btn { align-self: flex-start; margin-top: 8px; }
+.notice__x { position: absolute; top: 8px; right: 8px; width: 30px; height: 30px; border-radius: 10px; color: var(--muted); font-size: 13px; }
+
+.link-btn { color: var(--primary-ink); font-weight: 900; font-size: 14px; padding: 4px 2px; }
+.wday { padding: 0; }
+
+.avatars { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+.avatar-opt {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 8px 2px 8px; border-radius: 16px; background: var(--surface-2);
+  border: 2px solid var(--line); font-weight: 900; font-size: 12px; color: var(--ink-2);
+  transition: transform .15s, border-color .2s, background .2s;
+}
+.avatar-opt svg { width: 100%; max-width: 58px; height: auto; }
+.avatar-opt:active { transform: scale(.95); }
+.avatar-opt.is-active { border-color: var(--primary); background: var(--primary-soft); color: var(--primary-ink); }
+.swatches { flex-wrap: wrap; }
+
+.check-row { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 14px; padding: 6px 0; }
+.check-row span { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: 13px; font-weight: 900; flex: 0 0 auto; }
+.check-row .ok { background: var(--mint-soft); color: var(--mint); }
+.check-row .ko { background: #FFF1CC; color: #B07800; }

@@ -23,25 +23,28 @@
 
   // ================= Estado =================
   const STORE = 'pasito.v1';
+  const WALK_MIN = 15;   // pasos/minuto a partir de los que un minuto cuenta como "caminando"
   const defaults = () => ({
     settings: {
       name: '',
+      avatar: 'pipo',
       mascotName: 'Pipo',
       mascotColor: '#FF8A4C',
       dailyGoal: 8000,
       weeklyGoal: 50000,
       strideCm: 72,
       weightKg: 70,
-      sensitivity: 'media',
       theme: 'auto',
       dailyMilestones: [1000, 5000, 8000, 10000, 15000, 20000],
       weeklyMilestones: [35000, 50000, 70000, 100000],
       totalMilestones: [10000, 50000, 100000, 250000, 500000, 1000000],
       onboarded: false,
+      hideTips: {},
     },
-    days: {},      // 'YYYY-MM-DD' -> { sessions: [{id,start,end,steps,seconds,source}] }
-    badges: {},    // id -> { at: timestamp, count }
-    live: null,    // sesión en curso
+    // 'YYYY-MM-DD' -> { auto: { minutoDelDía: pasos }, sessions: [registros manuales] }
+    days: {},
+    badges: {},     // id -> { at, count }
+    lastSync: 0,    // último minuto (desde epoch) sincronizado con el contador del móvil
   });
 
   let S = load();
@@ -50,74 +53,164 @@
       const raw = localStorage.getItem(STORE);
       if (!raw) return defaults();
       const d = JSON.parse(raw), base = defaults();
+      delete d.live;
       return { ...base, ...d, settings: { ...base.settings, ...(d.settings || {}) } };
     } catch { return defaults(); }
   }
   function save() { try { localStorage.setItem(STORE, JSON.stringify(S)); } catch { /* sin espacio o modo privado */ } }
 
-  const dayOf = k => S.days[k] || { sessions: [] };
-  const daySteps = k => dayOf(k).sessions.reduce((a, s) => a + s.steps, 0) + (S.live && keyOf(new Date(S.live.start)) === k ? S.live.steps : 0);
-  const daySecs = k => dayOf(k).sessions.reduce((a, s) => a + s.seconds, 0) + (S.live && keyOf(new Date(S.live.start)) === k ? liveSeconds() : 0);
+  const dayOf = k => S.days[k] || { sessions: [], auto: {} };
+  const autoOf = k => (S.days[k] && S.days[k].auto) || {};
+  const manualOf = k => (S.days[k] && S.days[k].sessions) || [];
+  const sumVals = o => { let t = 0; for (const v of Object.values(o)) t += v; return t; };
+  const daySteps = k => sumVals(autoOf(k)) + manualOf(k).reduce((a, s) => a + s.steps, 0);
+  const activeMins = k => Object.values(autoOf(k)).filter(v => v >= WALK_MIN).length;
+  const daySecs = k => activeMins(k) * 60 + manualOf(k).reduce((a, s) => a + s.seconds, 0);
   const kmOf = steps => steps * S.settings.strideCm / 100000;
   const kcalOf = steps => steps * 0.04 * (S.settings.weightKg / 70);
-  const allKeys = () => Object.keys(S.days).filter(k => S.days[k].sessions.length).sort();
+  const hasData = k => !!S.days[k] && (manualOf(k).length > 0 || Object.keys(autoOf(k)).length > 0);
+  const allKeys = () => Object.keys(S.days).filter(hasData).sort();
   const weekSteps = monday => { let t = 0; for (let i = 0; i < 7; i++) t += daySteps(keyOf(addDays(monday, i))); return t; };
+  const ensureDay = k => { if (!S.days[k]) S.days[k] = { sessions: [], auto: {} }; if (!S.days[k].auto) S.days[k].auto = {}; if (!S.days[k].sessions) S.days[k].sessions = []; return S.days[k]; };
 
   function addSession(k, sess) {
-    if (!S.days[k]) S.days[k] = { sessions: [] };
-    S.days[k].sessions.push(sess);
-    S.days[k].sessions.sort((a, b) => a.start - b.start);
+    const d = ensureDay(k);
+    d.sessions.push(sess);
+    d.sessions.sort((a, b) => a.start - b.start);
   }
 
-  // ================= Mascota =================
+  // Caminatas detectadas solas: minutos seguidos caminando (huecos de hasta 2 min), de 5 min o más.
+  const walkCache = new Map();
+  function autoWalks(k) {
+    const auto = autoOf(k);
+    const sig = Object.keys(auto).length + ':' + sumVals(auto);
+    const c = walkCache.get(k); if (c && c.sig === sig) return c.walks;
+    const mins = Object.keys(auto).map(Number).sort((a, b) => a - b);
+    const walks = []; let cur = null;
+    const base = parseKey(k).getTime();
+    for (const m of mins) {
+      const v = auto[m];
+      if (v < WALK_MIN) { if (cur && m - cur.last <= 2) cur.steps += v; continue; }
+      if (cur && m - cur.last <= 3) { cur.last = m; cur.steps += v; cur.active++; }
+      else { if (cur) walks.push(cur); cur = { first: m, last: m, steps: v, active: 1 }; }
+    }
+    if (cur) walks.push(cur);
+    const out = walks.filter(w => w.last - w.first + 1 >= 5).map(w => ({
+      id: `a${k}-${w.first}`, start: base + w.first * 60000, end: base + (w.last + 1) * 60000,
+      steps: w.steps, seconds: w.active * 60, source: 'auto',
+    }));
+    walkCache.set(k, { sig, walks: out });
+    return out;
+  }
+  const sessionsOf = k => [...autoWalks(k), ...manualOf(k)].sort((a, b) => a.start - b.start);
+  const hourly = k => { const h = Array(24).fill(0); for (const [m, v] of Object.entries(autoOf(k))) h[Math.floor(m / 60)] += v; for (const s of manualOf(k)) h[new Date(s.start).getHours()] += s.steps; return h; };
+  // ¿Estás caminando ahora mismo? (pasos en los últimos 3 minutos)
+  function walkingNow() {
+    const now = new Date(), k = keyOf(now), m = now.getHours() * 60 + now.getMinutes(), a = autoOf(k);
+    return ((a[m] || 0) + (a[m - 1] || 0) + (a[m - 2] || 0)) >= 40;
+  }
+
+  // ================= Mascota (avatares) =================
+  const AVATARS = {
+    pipo: { name: 'Pipo', color: '#FF8A4C', desc: 'Una bolita con mucha energía' },
+    misi: { name: 'Misi', color: '#B39CFF', desc: 'Gata curiosa y paseadora' },
+    toby: { name: 'Toby', color: '#D29A66', desc: 'Perrito que nunca se cansa' },
+    copo: { name: 'Copo', color: '#FF5C9A', desc: 'Pingüino con bufanda' },
+    rex:  { name: 'Rex',  color: '#5FCB72', desc: 'Dino de pasos gigantes' },
+  };
+  const OUT = '#2A1F3D';
+
   function shade(hex, amt) {
     const n = parseInt(hex.slice(1), 16);
-    let r = (n >> 16) + amt, g = ((n >> 8) & 255) + amt, b = (n & 255) + amt;
-    r = clamp(r, 0, 255); g = clamp(g, 0, 255); b = clamp(b, 0, 255);
+    const r = clamp((n >> 16) + amt, 0, 255), g = clamp(((n >> 8) & 255) + amt, 0, 255), b = clamp((n & 255) + amt, 0, 255);
     return '#' + ((r << 16) | (g << 8) | b).toString(16).padStart(6, '0');
   }
-  function mascotSVG(mood = 'happy', color = S.settings.mascotColor) {
-    const dark = shade(color, -40), light = shade(color, 50);
-    const sleepy = mood === 'sleepy';
-    const party = mood === 'party';
+
+  function mascotSVG(mood = 'happy', avatar = S.settings.avatar, color = S.settings.mascotColor) {
+    if (!AVATARS[avatar]) avatar = 'pipo';
+    const dark = shade(color, -45), light = shade(color, 55);
+    const sleepy = mood === 'sleepy', party = mood === 'party';
+    const B = 'M56 18 C86 18 96 42 96 66 C96 92 80 104 56 104 C32 104 16 92 16 66 C16 42 26 18 56 18Z';
+    let back = '', body = '', front = '', arm = dark, mouthOn = true;
+
+    if (avatar === 'pipo') {
+      body = `<path d="M56 14 C84 14 96 38 96 64 C96 90 80 104 56 104 C32 104 16 90 16 64 C16 38 28 14 56 14Z" fill="${color}" stroke="${OUT}" stroke-width="2.5"/>
+        <path d="M30 40 C34 28 44 22 54 21" stroke="${light}" stroke-width="5" fill="none" stroke-linecap="round" opacity=".8"/>
+        <path d="M52 15 q-2 -9 6 -11 q-1 6 3 10" fill="${dark}" stroke="${OUT}" stroke-width="2" stroke-linejoin="round"/>
+        <path d="M24 46 Q56 30 88 46" stroke="#fff" stroke-width="7" fill="none" stroke-linecap="round"/>
+        <path d="M24 46 Q56 30 88 46" stroke="#7B61FF" stroke-width="2.5" fill="none" stroke-dasharray="4 5" stroke-linecap="round"/>`;
+    } else if (avatar === 'misi') {
+      back = `<path d="M86 94 q24 -2 16 -32" stroke="${OUT}" stroke-width="11" fill="none" stroke-linecap="round"/><path d="M86 94 q24 -2 16 -32" stroke="${color}" stroke-width="6.5" fill="none" stroke-linecap="round"/>
+        <path d="M22 48 L24 8 L52 22 Z" fill="${color}" stroke="${OUT}" stroke-width="2.5" stroke-linejoin="round"/><path d="M28 36 L29 17 L44 25 Z" fill="#FFB3C7"/>
+        <path d="M90 48 L88 8 L60 22 Z" fill="${color}" stroke="${OUT}" stroke-width="2.5" stroke-linejoin="round"/><path d="M84 36 L83 17 L68 25 Z" fill="#FFB3C7"/>`;
+      body = `<path d="${B}" fill="${color}" stroke="${OUT}" stroke-width="2.5"/>
+        <path d="M49 24 v7 M56 22 v8 M63 24 v7" stroke="${dark}" stroke-width="3" stroke-linecap="round"/>
+        <path d="M32 40 C36 30 44 25 50 24" stroke="${light}" stroke-width="5" fill="none" stroke-linecap="round" opacity=".8"/>`;
+      front = `<path d="M28 66 L12 62 M28 70 L12 72 M84 66 L100 62 M84 70 L100 72" stroke="${OUT}" stroke-width="1.8" stroke-linecap="round"/>
+        <path d="M52.5 63.5 h7 l-3.5 3.5z" fill="#FF7A9A"/>`;
+    } else if (avatar === 'toby') {
+      body = `<path d="${B}" fill="${color}" stroke="${OUT}" stroke-width="2.5"/>
+        <ellipse cx="68" cy="55" rx="12" ry="11" fill="${light}"/>
+        <path d="M32 40 C36 30 44 25 52 23" stroke="${light}" stroke-width="5" fill="none" stroke-linecap="round" opacity=".7"/>`;
+      front = `<path d="M26 28 q-18 4 -14 36 q5 10 15 1 q1 -21 7 -31z" fill="${dark}" stroke="${OUT}" stroke-width="2.5" stroke-linejoin="round"/>
+        <path d="M86 28 q18 4 14 36 q-5 10 -15 1 q-1 -21 -7 -31z" fill="${dark}" stroke="${OUT}" stroke-width="2.5" stroke-linejoin="round"/>
+        <ellipse cx="56" cy="64.5" rx="5" ry="3.6" fill="${OUT}"/>
+        <path d="M28 90 Q56 102 84 90" stroke="#7B61FF" stroke-width="5" fill="none" stroke-linecap="round"/>
+        <circle cx="56" cy="98" r="4.5" fill="#F5B301" stroke="${OUT}" stroke-width="1.5"/>`;
+    } else if (avatar === 'copo') {
+      arm = '#2F3A56';
+      body = `<path d="${B}" fill="#2F3A56" stroke="${OUT}" stroke-width="2.5"/>
+        <path d="M56 32 C76 32 86 46 86 64 C86 86 72 100 56 100 C40 100 26 86 26 64 C26 46 36 32 56 32Z" fill="#fff"/>
+        <path d="M34 30 C40 24 46 22 52 21" stroke="#56628A" stroke-width="4" fill="none" stroke-linecap="round"/>`;
+      front = `<path d="M49.5 63 h13 l-6.5 7z" fill="#FFB020" stroke="${OUT}" stroke-width="1.6" stroke-linejoin="round"/>
+        <path d="M22 82 Q56 98 90 82" stroke="${color}" stroke-width="9" fill="none" stroke-linecap="round"/>
+        <path d="M70 90 l5 14" stroke="${color}" stroke-width="7" stroke-linecap="round"/>
+        <path d="M30 86 l4 2 M44 91 l4 1 M60 92 l4 -1" stroke="#fff" stroke-width="2" stroke-linecap="round" opacity=".7"/>`;
+      mouthOn = party;
+    } else if (avatar === 'rex') {
+      back = `<path d="M24 90 q-22 6 -20 -16 q8 10 22 4z" fill="${color}" stroke="${OUT}" stroke-width="2.5" stroke-linejoin="round"/>
+        <path d="M32 32 l4 -16 l10 10z M48 22 l8 -16 l8 16z M66 26 l10 -10 l4 16z" fill="${light}" stroke="${OUT}" stroke-width="2.5" stroke-linejoin="round"/>`;
+      body = `<path d="${B}" fill="${color}" stroke="${OUT}" stroke-width="2.5"/>
+        <ellipse cx="56" cy="90" rx="22" ry="11" fill="${light}" opacity=".75"/>
+        <circle cx="28" cy="52" r="3" fill="${dark}" opacity=".5"/><circle cx="86" cy="58" r="2.5" fill="${dark}" opacity=".5"/><circle cx="80" cy="38" r="3.2" fill="${dark}" opacity=".5"/>`;
+    }
+
     const eyes = sleepy
-      ? `<path d="M40 58 q5 4 10 0 M62 58 q5 4 10 0" stroke="#2A1F3D" stroke-width="3" fill="none" stroke-linecap="round"/>`
+      ? `<path d="M40 58 q5 4 10 0 M62 58 q5 4 10 0" stroke="${OUT}" stroke-width="3" fill="none" stroke-linecap="round"/>`
       : party
-        ? `<path d="M39 59 q6 -8 12 0 M61 59 q6 -8 12 0" stroke="#2A1F3D" stroke-width="3.4" fill="none" stroke-linecap="round"/>`
-        : `<g class="m-eyes"><ellipse cx="45" cy="57" rx="5" ry="6.2" fill="#2A1F3D"/><ellipse cx="67" cy="57" rx="5" ry="6.2" fill="#2A1F3D"/><circle cx="46.8" cy="54.8" r="1.8" fill="#fff"/><circle cx="68.8" cy="54.8" r="1.8" fill="#fff"/></g>`;
-    const mouth = sleepy
-      ? `<ellipse cx="56" cy="72" rx="3" ry="2.4" fill="#2A1F3D"/>`
+        ? `<path d="M39 59 q6 -8 12 0 M61 59 q6 -8 12 0" stroke="${OUT}" stroke-width="3.4" fill="none" stroke-linecap="round"/>`
+        : `<g class="m-eyes"><ellipse cx="45" cy="56" rx="5" ry="6.2" fill="${OUT}"/><ellipse cx="67" cy="56" rx="5" ry="6.2" fill="${OUT}"/><circle cx="46.8" cy="53.8" r="1.8" fill="#fff"/><circle cx="68.8" cy="53.8" r="1.8" fill="#fff"/></g>`;
+    const mouth = !mouthOn ? '' : sleepy
+      ? `<ellipse cx="56" cy="73" rx="3" ry="2.4" fill="${OUT}"/>`
       : party || mood === 'walking'
-        ? `<path d="M47 68 q9 12 18 0 z" fill="#2A1F3D"/><path d="M51 72 q5 4 10 0" fill="#FF5C7A"/>`
-        : `<path d="M49 69 q7 7 14 0" stroke="#2A1F3D" stroke-width="3" fill="none" stroke-linecap="round"/>`;
+        ? `<path d="M47 70 q9 12 18 0 z" fill="${OUT}"/><path d="M51 74 q5 4 10 0" fill="#FF5C7A"/>`
+        : `<path d="M49 70 q7 7 14 0" stroke="${OUT}" stroke-width="3" fill="none" stroke-linecap="round"/>`;
+    const shoe = (x, cls) => `<g class="${cls}"><path d="M${x} 100 h20 a6 6 0 0 1 6 6 v2 a2 2 0 0 1 -2 2 h-26 a6 6 0 0 1 -6 -6 a4 4 0 0 1 8 -4z" fill="#fff" stroke="${OUT}" stroke-width="2.5"/><path d="M${x - 2} 108 h28" stroke="${avatar === 'copo' ? color : color}" stroke-width="2.5"/></g>`;
     return `
-<svg class="mascot is-${mood}" viewBox="0 0 112 120" aria-hidden="true">
-  <ellipse cx="56" cy="113" rx="30" ry="4.5" fill="#2A1F3D" opacity=".10"/>
+<svg class="mascot is-${mood}" viewBox="-4 -4 120 124" aria-hidden="true">
+  <ellipse cx="56" cy="113" rx="30" ry="4.5" fill="${OUT}" opacity=".10"/>
   <g class="m-body">
-    <g class="m-foot-l"><path d="M30 100 h20 a6 6 0 0 1 6 6 v2 a2 2 0 0 1 -2 2 h-26 a6 6 0 0 1 -6 -6 a4 4 0 0 1 8 -4z" fill="#fff" stroke="#2A1F3D" stroke-width="2.5"/><path d="M28 108 h28" stroke="${color}" stroke-width="2.5"/></g>
-    <g class="m-foot-r"><path d="M62 100 h20 a6 6 0 0 1 6 6 v2 a2 2 0 0 1 -2 2 h-26 a6 6 0 0 1 -6 -6 a4 4 0 0 1 8 -4z" fill="#fff" stroke="#2A1F3D" stroke-width="2.5"/><path d="M60 108 h28" stroke="${color}" stroke-width="2.5"/></g>
-    <path class="m-arm-l" d="M20 62 q-10 6 -8 18" stroke="${dark}" stroke-width="7" fill="none" stroke-linecap="round"/>
-    <path class="m-arm-r" d="M92 62 q10 6 8 18" stroke="${dark}" stroke-width="7" fill="none" stroke-linecap="round"/>
-    <path d="M56 14 C84 14 96 38 96 64 C96 90 80 104 56 104 C32 104 16 90 16 64 C16 38 28 14 56 14Z" fill="${color}" stroke="#2A1F3D" stroke-width="2.5"/>
-    <path d="M30 40 C34 28 44 22 54 21" stroke="${light}" stroke-width="5" fill="none" stroke-linecap="round" opacity=".8"/>
-    <path d="M52 15 q-2 -9 6 -11 q-1 6 3 10" fill="${dark}" stroke="#2A1F3D" stroke-width="2" stroke-linejoin="round"/>
-    <path d="M24 46 Q56 30 88 46" stroke="#fff" stroke-width="7" fill="none" stroke-linecap="round"/>
-    <path d="M24 46 Q56 30 88 46" stroke="#7B61FF" stroke-width="2.5" fill="none" stroke-dasharray="4 5" stroke-linecap="round"/>
+    ${back}
+    ${shoe(30, 'm-foot-l')}${shoe(62, 'm-foot-r')}
+    <path class="m-arm-l" d="M20 62 q-10 6 -8 18" stroke="${arm}" stroke-width="7" fill="none" stroke-linecap="round"/>
+    <path class="m-arm-r" d="M92 62 q10 6 8 18" stroke="${arm}" stroke-width="7" fill="none" stroke-linecap="round"/>
+    ${body}
     ${eyes}
     <ellipse cx="35" cy="68" rx="5.5" ry="3.5" fill="#FF5C7A" opacity=".35"/>
     <ellipse cx="77" cy="68" rx="5.5" ry="3.5" fill="#FF5C7A" opacity=".35"/>
+    ${front}
     ${mouth}
   </g>
-  ${sleepy ? `<text class="m-zzz" x="88" y="22" font-family="Nunito, sans-serif" font-weight="900" font-size="16" fill="#7B61FF">z</text>` : ''}
-  ${party ? `<g font-size="14"><text x="0" y="24">✨</text><text x="92" y="16">🎉</text></g>` : ''}
+  ${sleepy ? `<text class="m-zzz" x="90" y="20" font-family="Nunito, sans-serif" font-weight="900" font-size="16" fill="#7B61FF">z</text>` : ''}
+  ${party ? `<g font-size="14"><text x="-2" y="22">✨</text><text x="94" y="14">🎉</text></g>` : ''}
 </svg>`;
   }
 
   function mascotMood(steps, goal) {
-    if (S.live && !S.live.paused) return 'walking';
+    if (walkingNow()) return 'walking';
     if (steps >= goal) return 'party';
     const h = new Date().getHours();
-    if (steps === 0 && (h < 9 || h >= 22)) return 'sleepy';
+    if (steps < 50 && (h < 9 || h >= 22)) return 'sleepy';
     return 'happy';
   }
 
@@ -127,9 +220,9 @@
     const pct = steps / goal;
     const h = new Date().getHours();
     const pick = arr => arr[(new Date().getDate() + Math.floor(steps / 500)) % arr.length];
-    if (S.live && !S.live.paused) return pick(['¡Eso es! Sigue a este ritmo 💪', '¡Vamos, vamos! Cada paso cuenta 👟', '¡Qué buen paso llevas hoy!']);
+    if (walkingNow()) return pick(['¡Te veo caminando! Sigue así 💪', '¡Vamos, vamos! Cada paso cuenta 👟', '¡Qué buen ritmo llevas!']);
     if (pct >= 1.5) return pick([`¡Leyenda${n}! Has superado tu objetivo con creces 🔥`, '¡Hoy estás imparable! 🚀']);
-    if (pct >= 1) return pick([`¡Objetivo cumplido${n}! Estoy muy orgulloso 🎉`, '¡Lo lograste! Hoy toca celebrarlo 🥳']);
+    if (pct >= 1) return pick([`¡Objetivo cumplido${n}! Qué orgullo 🎉`, '¡Lo lograste! Hoy toca celebrarlo 🥳']);
     if (pct >= .75) return `¡Casi lo tienes! Solo ${fmt(left)} pasos más 🙌`;
     if (pct >= .5) return pick([`¡Ya vas por la mitad${n}! Un paseíto y lo rematas`, `Te quedan ${fmt(left)} pasos. ¡Tú puedes!`]);
     if (steps > 0) return pick([`¡Buen comienzo! Faltan ${fmt(left)} pasos`, '¿Un paseo después de comer? Me apunto 🚶']);
@@ -149,8 +242,6 @@
     const keys = allKeys();
     const goal = S.settings.dailyGoal;
     const dayVals = keys.map(k => ({ k, steps: daySteps(k), secs: daySecs(k) }));
-    const tk = todayKey();
-    if (S.live && !keys.includes(tk)) dayVals.push({ k: tk, steps: daySteps(tk), secs: daySecs(tk) });
     // racha
     let best = 0, cur = 0, prev = null;
     const metKeys = dayVals.filter(d => d.steps >= goal).map(d => d.k).sort();
@@ -166,7 +257,7 @@
     const weeks = {};
     for (const dv of dayVals) { const m = keyOf(mondayOf(parseKey(dv.k))); weeks[m] = (weeks[m] || 0) + dv.steps; }
     const sessions = [];
-    for (const k of keys) sessions.push(...S.days[k].sessions);
+    for (const k of keys) sessions.push(...sessionsOf(k));
     return { dayVals, best, current, weeks, sessions, total: dayVals.reduce((a, x) => a + x.steps, 0) };
   }
 
@@ -235,81 +326,48 @@
     return { level: n + 1, title: LEVELS[Math.min(n, LEVELS.length - 1)], pct: (total - lo) / (hi - lo), left: hi - total };
   }
 
-  // ================= Sensor de pasos =================
-  const SENS = { baja: 1.6, media: 1.15, alta: 0.75 };
-  const motion = { f: 9.81, base: 9.81, prev: 0, rising: false, last: 0, on: false };
-  function onMotion(e) {
-    if (!S.live || S.live.paused) return;
-    const a = e.accelerationIncludingGravity; if (!a || a.x == null) return;
-    const mag = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
-    motion.f = motion.f * 0.75 + mag * 0.25;           // suavizado
-    motion.base = motion.base * 0.97 + mag * 0.03;      // línea base (gravedad)
-    const d = motion.f - motion.base;
-    const t = e.timeStamp || performance.now();
-    const th = SENS[S.settings.sensitivity] || SENS.media;
-    if (d < motion.prev && motion.rising && motion.prev > th && t - motion.last > 260) {
-      motion.last = t; countStep(1);
-    }
-    motion.rising = d > motion.prev;
-    motion.prev = d;
+  // ================= Contador automático (app de Android) =================
+  // En la app nativa, un servicio en segundo plano lee el contador de pasos del propio móvil
+  // y guarda los pasos minuto a minuto. Aquí solo los recogemos y los guardamos por días.
+  const Native = (window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform())
+    ? window.Capacitor.Plugins.Pasos : null;
+  let counter = null;   // estado del contador: { available, permission, running, enabled, batteryOptimized }
+  let syncing = false;
+
+  async function refreshCounter() {
+    if (!Native) return;
+    try { counter = await Native.status(); } catch { counter = null; }
   }
-  async function startSensor() {
-    if (typeof DeviceMotionEvent === 'undefined') return false;
+
+  async function sync({ quiet = false } = {}) {
+    if (!Native || syncing) return;
+    syncing = true;
     try {
-      if (typeof DeviceMotionEvent.requestPermission === 'function') {
-        const r = await DeviceMotionEvent.requestPermission();
-        if (r !== 'granted') return false;
+      const since = S.lastSync ? S.lastSync - 120 : 0;
+      const res = await Native.getBuckets({ since });
+      let changed = false;
+      for (const [m, steps] of res.buckets || []) {
+        const d = new Date(m * 60000), k = keyOf(d), mod = d.getHours() * 60 + d.getMinutes();
+        const day = ensureDay(k);
+        if (day.auto[mod] !== steps) { day.auto[mod] = steps; changed = true; }
       }
-      if (!motion.on) { window.addEventListener('devicemotion', onMotion); motion.on = true; }
-      return true;
-    } catch { return false; }
-  }
-  function stopSensor() { window.removeEventListener('devicemotion', onMotion); motion.on = false; }
-
-  let wakeLock = null;
-  async function keepAwake(on) {
-    try {
-      if (on && 'wakeLock' in navigator && !wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); }
-      if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; }
-    } catch { /* no disponible */ }
-  }
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S.live && !S.live.paused) keepAwake(true); });
-
-  function liveSeconds() {
-    if (!S.live) return 0;
-    return S.live.acc + (S.live.paused ? 0 : (Date.now() - S.live.resumedAt) / 1000);
-  }
-  let lastSave = 0, sensorSeen = false;
-  function countStep(n) {
-    if (!S.live) return;
-    S.live.steps += n; sensorSeen = true;
-    if (Date.now() - lastSave > 3000) { save(); lastSave = Date.now(); }
-    updateLive();
+      S.lastSync = res.now;
+      save();
+      if (changed && !$('.sheet')) { render({ soft: true }); if (!quiet) checkBadges(); }
+    } catch { /* el servicio aún no tiene datos */ }
+    finally { syncing = false; }
   }
 
-  async function startWalk() {
-    const ok = await startSensor();
-    S.live = { id: 's' + Date.now(), start: Date.now(), resumedAt: Date.now(), acc: 0, steps: 0, paused: false, sensor: ok };
-    sensorSeen = false;
-    save(); keepAwake(true);
-    toast(ok ? '¡A caminar! Llévate el móvil contigo 👟' : 'Sin sensor de movimiento: usa el botón "+1 paso" o añade los pasos al terminar');
+  async function enableCounter() {
+    if (!Native) return;
+    try { counter = await Native.enable(); } catch { await refreshCounter(); }
+    if (counter && counter.permission === 'granted' && counter.running) {
+      toast(`¡Listo! ${S.settings.mascotName} ya cuenta tus pasos en segundo plano 👟`);
+      Native.setGoal({ goal: S.settings.dailyGoal }).catch(() => {});
+    } else if (counter && counter.permission === 'denied') {
+      toast('Sin el permiso de actividad física no puedo contar pasos. Puedes darlo en Ajustes del móvil.');
+    }
     render();
-  }
-  function togglePause() {
-    if (!S.live) return;
-    if (S.live.paused) { S.live.paused = false; S.live.resumedAt = Date.now(); keepAwake(true); }
-    else { S.live.acc = liveSeconds(); S.live.paused = true; keepAwake(false); }
-    save(); render();
-  }
-  function finishWalk() {
-    if (!S.live) return;
-    const l = S.live, secs = Math.round(liveSeconds());
-    S.live = null; stopSensor(); keepAwake(false);
-    if (l.steps > 0 || secs > 30) {
-      addSession(keyOf(new Date(l.start)), { id: l.id, start: l.start, end: Date.now(), steps: l.steps, seconds: secs, source: 'sensor' });
-      toast(`Caminata guardada: ${fmt(l.steps)} pasos en ${fmtDur(secs)}`);
-    } else toast('Caminata descartada (demasiado corta)');
-    save(); render(); checkBadges();
   }
 
   // ================= UI general =================
@@ -320,13 +378,13 @@
     $$('.tab').forEach(b => { b.classList.toggle('is-active', b.dataset.tab === t); b.setAttribute('aria-current', b.dataset.tab === t ? 'page' : 'false'); });
     render(); window.scrollTo({ top: 0 });
   }
-  function render() {
+  function render(opts = {}) {
     const now = new Date(), h = now.getHours();
     $('#greet').textContent = (h < 6 ? 'Buenas noches' : h < 13 ? 'Buenos días' : h < 21 ? 'Buenas tardes' : 'Buenas noches') + (S.settings.name ? `, ${S.settings.name}` : '') + ' 👋';
     const ds = now.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' }); $('#today-date').textContent = ds[0].toUpperCase() + ds.slice(1);
     const v = $('#view');
     v.innerHTML = views[tab]();
-    v.style.animation = 'none'; void v.offsetWidth; v.style.animation = '';
+    if (opts.soft) v.style.animation = 'none'; else { v.style.animation = 'none'; void v.offsetWidth; v.style.animation = ''; }
     bindView();
   }
 
@@ -354,22 +412,57 @@
   const medal = (b, extra = '') => `<div class="medal ${b.tier} ${extra}">${b.icon}</div>`;
 
   // ================= Vista: Hoy =================
+  function counterCard() {
+    const tips = S.settings.hideTips;
+    if (!Native) {
+      if (tips.web) return '';
+      return `<div class="notice">
+        <div class="notice__icon">📲</div>
+        <div class="notice__txt"><strong>Cuenta automática en la app de Android</strong><span>En el navegador no se pueden leer los pasos del móvil. Aquí puedes añadirlos a mano o explorar la app.</span></div>
+        <button class="notice__x" data-hide="web" aria-label="Ocultar">✕</button></div>`;
+    }
+    if (!counter) return '';
+    if (!counter.available) return `<div class="notice is-warn"><div class="notice__icon">⚠️</div><div class="notice__txt"><strong>Este móvil no tiene contador de pasos</strong><span>Puedes seguir apuntando tus pasos a mano.</span></div></div>`;
+    if (counter.permission === 'denied') return `<div class="notice is-warn"><div class="notice__icon">🔒</div><div class="notice__txt"><strong>Falta el permiso de actividad física</strong><span>Sin él no puedo contar tus pasos.</span><button class="btn btn--primary btn--sm" data-act="app-settings">Abrir ajustes del móvil</button></div></div>`;
+    if (!counter.running) return `<div class="notice is-cta"><div class="notice__icon">👟</div><div class="notice__txt"><strong>Activa el contador automático</strong><span>Contaré tus pasos en segundo plano, sin que tengas que hacer nada.</span><button class="btn btn--primary btn--sm" data-act="enable">Activar ahora</button></div></div>`;
+    if (counter.batteryOptimized && !tips.battery) return `<div class="notice">
+      <div class="notice__icon">🔋</div>
+      <div class="notice__txt"><strong>Que Android no me duerma</strong><span>Algunos móviles detienen las apps en segundo plano. Permite que Pasito funcione sin restricciones de batería (gasta muy poco).</span><button class="btn btn--soft btn--sm" data-act="battery">Permitir</button></div>
+      <button class="notice__x" data-hide="battery" aria-label="Ocultar">✕</button></div>`;
+    return '';
+  }
+
+  function hourChart(k) {
+    const h = hourly(k), now = new Date(), isToday = k === todayKey();
+    const max = Math.max(500, ...h), W = 340, H = 96, pb = 16, cw = W / 24, bw = cw - 4;
+    let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Pasos por hora">`;
+    s += `<line class="grid-line" x1="0" x2="${W}" y1="${H - pb}" y2="${H - pb}"/>`;
+    h.forEach((v, i) => {
+      const x = i * cw + 2, bh = v ? Math.max(3, (H - pb - 6) * v / max) : 0, y = H - pb - bh, r = Math.min(3, bw / 2, bh);
+      s += `<rect class="hit" x="${i * cw}" y="0" width="${cw}" height="${H - pb}" data-i="${i}"/>`;
+      if (bh) s += `<path class="bar ${v >= 250 ? 'is-met' : ''}" data-bar="${i}" d="M${x},${H - pb} V${y + r} Q${x},${y} ${x + r},${y} H${x + bw - r} Q${x + bw},${y} ${x + bw},${y + r} V${H - pb} Z"/>`;
+      else if (!isToday || i <= now.getHours()) s += `<rect x="${x + bw / 2 - 1.5}" y="${H - pb - 3}" width="3" height="3" rx="1.5" fill="var(--line)"/>`;
+      if (i % 6 === 0) s += `<text class="axis-lbl" x="${i * cw + 2}" y="${H - 3}">${i}h</text>`;
+    });
+    s += `</svg>`;
+    chartData = h.map((v, i) => ({ tip: `${fmt(v)} pasos<small>${pad(i)}:00 – ${pad(i)}:59</small>` }));
+    return `<div class="chart" id="chart">${s}<div class="tooltip" id="tip"></div></div>`;
+  }
+
   views.hoy = () => {
     const tk = todayKey(), goal = S.settings.dailyGoal;
     const steps = daySteps(tk), secs = daySecs(tk);
-    const pct = steps / goal;
-    const done = steps >= goal;
+    const pct = steps / goal, done = steps >= goal;
     const mood = mascotMood(steps, goal);
-    const mon = mondayOf(new Date());
-    const wk = weekSteps(mon);
-    const st = computeStats();
-    const cat = badgeCatalog(st);
+    const mon = mondayOf(new Date()), wk = weekSteps(mon);
+    const st = computeStats(), cat = badgeCatalog(st);
     const next = cat.filter(b => b.count === 0 && b.progress > 0 && b.group !== 'Especiales').sort((a, b) => b.progress - a.progress)[0]
       || cat.filter(b => b.count === 0).sort((a, b) => b.progress - a.progress)[0];
     const pace = secs > 60 ? steps / (secs / 60) : 0;
-    const sessions = dayOf(tk).sessions.slice().reverse();
+    const sessions = sessionsOf(tk).reverse();
 
     return `
+    ${counterCard()}
     <section class="hero">
       <div class="hero__top">
         <div class="mascot-wrap" id="mascot">${mascotSVG(mood)}</div>
@@ -378,37 +471,28 @@
       <div class="ring-wrap">
         ${ringSVG(pct)}
         <div class="ring-center">
-          <div class="ring-steps num" id="ring-steps">${fmt(steps)}</div>
+          <div class="ring-steps num">${fmt(steps)}</div>
           <div class="ring-label">pasos hoy</div>
           <div class="ring-goal ${done ? 'is-done' : ''}">${done ? '✓ Objetivo cumplido' : `${Math.round(pct * 100)}% de ${fmtK(goal)}`}</div>
         </div>
       </div>
       <div class="metrics">
-        <div class="metric"><div class="metric__icon">⏱️</div><div class="metric__val num" id="m-time">${fmtDur(secs)}</div><div class="metric__lbl">activo</div></div>
+        <div class="metric"><div class="metric__icon">⏱️</div><div class="metric__val num">${fmtDur(secs)}</div><div class="metric__lbl">caminando</div></div>
         <div class="metric"><div class="metric__icon">📍</div><div class="metric__val num">${fmtKm(kmOf(steps))}</div><div class="metric__lbl">km</div></div>
         <div class="metric"><div class="metric__icon">🔥</div><div class="metric__val num">${fmt(kcalOf(steps))}</div><div class="metric__lbl">kcal</div></div>
         <div class="metric"><div class="metric__icon">⚡</div><div class="metric__val num">${pace ? fmt(pace) : '–'}</div><div class="metric__lbl">pasos/min</div></div>
       </div>
     </section>
 
-    ${S.live ? liveCard() : `
-    <div class="walk">
-      <button class="btn btn--primary" data-act="start">
-        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5Z"/></svg>
-        Empezar caminata
-      </button>
-      <button class="btn btn--ghost" data-act="manual" aria-label="Añadir pasos a mano">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-        Añadir
-      </button>
-    </div>`}
+    <div class="section-title">Hoy, hora a hora <button class="link-btn" data-act="manual">+ Añadir pasos</button></div>
+    <div class="card">${hourChart(tk)}</div>
 
     <div class="section-title">Esta semana <small>${fmt(wk)} / ${fmtK(S.settings.weeklyGoal)}</small></div>
     <div class="card">
       <div class="week-strip">
         ${DOW.map((d, i) => {
           const k = keyOf(addDays(mon, i)), s = daySteps(k);
-          return `<div class="wday ${k === tk ? 'is-today' : ''}"><span class="wday__lbl">${d}</span><div class="wday__ring">${miniRing(s / goal, s >= goal)}</div><span class="wday__val num">${s ? fmtK(s) : '·'}</span></div>`;
+          return `<button class="wday ${k === tk ? 'is-today' : ''}" ${hasData(k) ? `data-day="${k}"` : ''}><span class="wday__lbl">${d}</span><div class="wday__ring">${miniRing(s / goal, s >= goal)}</div><span class="wday__val num">${s ? fmtK(s) : '·'}</span></button>`;
         }).join('')}
       </div>
       <div class="bar-progress is-violet" style="margin-top:14px"><i style="width:${clamp(wk / S.settings.weeklyGoal, 0, 1) * 100}%"></i></div>
@@ -421,7 +505,7 @@
 
     ${next ? `
     <div class="section-title">Próxima insignia</div>
-    <button class="card next-badge" data-go="logros" style="width:100%;text-align:left">
+    <button class="card next-badge" data-badge="${next.id}" style="width:100%;text-align:left">
       ${medal(next)}
       <div class="next-badge__txt">
         <div class="next-badge__title">${esc(next.name)}</div>
@@ -431,49 +515,9 @@
     </button>` : ''}
 
     <div class="section-title">Caminatas de hoy <small>${sessions.length || ''}</small></div>
-    ${sessions.length ? `<div class="list">${sessions.map(sessionItem).join('')}</div>` : `<div class="empty">Todavía no hay caminatas hoy.<br>¡Pulsa “Empezar caminata” y ${esc(S.settings.mascotName)} te acompaña!</div>`}
+    ${sessions.length ? `<div class="list">${sessions.map(sessionItem).join('')}</div>` : `<div class="empty">Cuando camines 5 minutos seguidos o más, la caminata aparecerá aquí sola, con su duración y su ritmo.</div>`}
     `;
   };
-
-  function liveCard() {
-    const l = S.live, secs = liveSeconds();
-    return `
-    <div class="live" id="live">
-      <div class="live__row">
-        <span class="live__badge"><span class="live__dot ${l.paused ? 'is-paused' : ''}"></span>${l.paused ? 'En pausa' : 'Caminando'}</span>
-        <span class="live__badge" style="color:#CFC4E6">desde las ${new Date(l.start).toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })}</span>
-      </div>
-      <div class="live__grid">
-        <div><div class="live__val num" id="lv-steps">${fmt(l.steps)}</div><div class="live__lbl">pasos</div></div>
-        <div><div class="live__val num" id="lv-time">${fmtClock(secs)}</div><div class="live__lbl">tiempo</div></div>
-        <div><div class="live__val num" id="lv-pace">${secs > 20 ? fmt(l.steps / (secs / 60)) : '–'}</div><div class="live__lbl">pasos/min</div></div>
-      </div>
-      <div class="live__actions">
-        <button class="btn btn--soft" data-act="pause" style="flex:1">${l.paused ? '▶ Reanudar' : '❚❚ Pausar'}</button>
-        <button class="btn btn--primary" data-act="finish">✓ Terminar</button>
-      </div>
-      <button class="tap-step" data-act="tap">+1 paso (prueba manual)</button>
-      <p class="live__hint" id="lv-hint">${l.sensor ? 'Mantén la pantalla encendida y el móvil en la mano o el bolsillo. La app cuenta los pasos con el acelerómetro.' : 'Este dispositivo no da acceso al sensor de movimiento. El tiempo sí se registra; al terminar puedes editar los pasos.'}</p>
-    </div>`;
-  }
-
-  function updateLive() {
-    if (tab !== 'hoy' || !S.live) return;
-    const secs = liveSeconds();
-    const e1 = $('#lv-steps'), e2 = $('#lv-time'), e3 = $('#lv-pace');
-    if (e1) e1.textContent = fmt(S.live.steps);
-    if (e2) e2.textContent = fmtClock(secs);
-    if (e3) e3.textContent = secs > 20 ? fmt(S.live.steps / (secs / 60)) : '–';
-    const rs = $('#ring-steps'); if (rs) rs.textContent = fmt(daySteps(todayKey()));
-  }
-  setInterval(() => {
-    if (!S.live) return;
-    updateLive();
-    if (S.live.sensor && !sensorSeen && liveSeconds() > 25) { const h = $('#lv-hint'); if (h && !h.dataset.w) { h.dataset.w = 1; h.textContent = 'Aún no detecto pasos. Si estás en un ordenador, usa “+1 paso” o añade los pasos a mano al terminar.'; } }
-  }, 1000);
-  // Refresco del anillo cada 15 s para que avance sin parpadeos
-  let lastRingSteps = -1;
-  setInterval(() => { if (S.live && tab === 'hoy') { const s = daySteps(todayKey()); if (Math.abs(s - lastRingSteps) >= 20) { lastRingSteps = s; const r = $('.ring-wrap svg'); if (r) r.outerHTML = ringSVG(s / S.settings.dailyGoal); } } }, 15000);
 
   function sessionItem(s) {
     const t1 = new Date(s.start).toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
@@ -539,7 +583,7 @@
         const s = daySteps(k), sec = daySecs(k), d = parseKey(k);
         return `<button class="item" data-day="${k}">
           <div style="width:42px;height:42px">${miniRing(s / goal, s >= goal)}</div>
-          <div class="item__main"><div class="item__title" style="text-transform:capitalize">${d.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric' })}</div><div class="item__sub">${fmtDur(sec)} · ${fmtKm(kmOf(s))} km · ${dayOf(k).sessions.length} ${dayOf(k).sessions.length === 1 ? 'caminata' : 'caminatas'}</div></div>
+          <div class="item__main"><div class="item__title" style="text-transform:capitalize">${d.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric' })}</div><div class="item__sub">${fmtDur(sec)} · ${fmtKm(kmOf(s))} km · ${sessionsOf(k).length} ${sessionsOf(k).length === 1 ? 'caminata' : 'caminatas'}</div></div>
           <div class="item__end num">${fmt(s)}<small>pasos</small></div>
           <svg class="chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
         </button>`;
@@ -657,7 +701,7 @@
     });
     s += `<line class="goal-line" x1="${padL}" x2="${W}" y1="${y(goal)}" y2="${y(goal)}"/>`;
     s += `</svg>`;
-    chartData = days;
+    chartData = days.map(d => ({ tip: `${fmt(d.steps)} pasos<small>${d.d.toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric', month: 'short' })} · ${fmtDur(d.secs)}</small>` }));
     return `<div class="chart" id="chart" style="margin-top:12px">${s}<div class="tooltip" id="tip"></div></div>`;
   }
   let chartData = [];
@@ -700,21 +744,21 @@
   function bindView() {
     const v = $('#view');
     v.onclick = e => {
-      const t = e.target.closest('[data-act],[data-go],[data-day],[data-range],[data-badge]');
+      const t = e.target.closest('[data-act],[data-go],[data-day],[data-range],[data-badge],[data-hide]');
       if (!t) return;
       if (t.dataset.act) {
         const a = t.dataset.act;
-        if (a === 'start') startWalk();
-        else if (a === 'pause') togglePause();
-        else if (a === 'finish') finishWalk();
-        else if (a === 'tap') { countStep(1); }
-        else if (a === 'manual') manualSheet();
+        if (a === 'manual') manualSheet();
+        else if (a === 'enable') enableCounter();
+        else if (a === 'battery') { Native && Native.openBatterySettings(); S.settings.hideTips.battery = true; save(); setTimeout(() => refreshCounter().then(() => render({ soft: true })), 4000); }
+        else if (a === 'app-settings') { Native && Native.openAppSettings(); }
         else if (a === 'cal-prev') { calMonth = new Date(calMonth.getFullYear(), calMonth.getMonth() - 1, 1); render(); }
         else if (a === 'cal-next') { calMonth = new Date(calMonth.getFullYear(), calMonth.getMonth() + 1, 1); render(); }
         else if (a === 'demo') { loadDemo(); }
         else if (a === 'settings') settingsSheet();
         return;
       }
+      if (t.dataset.hide) { S.settings.hideTips[t.dataset.hide] = true; save(); return render({ soft: true }); }
       if (t.dataset.go) return setTab(t.dataset.go);
       if (t.dataset.range) { statRange = +t.dataset.range; return render(); }
       if (t.dataset.badge) return badgeSheet(t.dataset.badge);
@@ -728,7 +772,7 @@
         const i = +el.dataset.i, d = chartData[i];
         $$('.bar', chart).forEach(b => b.classList.toggle('is-hover', +b.dataset.bar === i));
         const r = el.getBoundingClientRect(), cr = chart.getBoundingClientRect();
-        tip.innerHTML = `${fmt(d.steps)} pasos<small>${d.d.toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric', month: 'short' })} · ${fmtDur(d.secs)}</small>`;
+        tip.innerHTML = d.tip;
         tip.style.left = clamp(r.left - cr.left + r.width / 2, 50, cr.width - 50) + 'px';
         tip.style.top = '10px';
         tip.classList.add('is-on');
@@ -790,11 +834,12 @@
   function removeSession(k, id) {
     if (!S.days[k]) return;
     S.days[k].sessions = S.days[k].sessions.filter(s => s.id !== id);
-    if (!S.days[k].sessions.length) delete S.days[k];
+    if (!hasData(k)) delete S.days[k];
   }
 
   function sessionSheet(k, id) {
-    const s = dayOf(k).sessions.find(x => x.id === id); if (!s) return;
+    const s = sessionsOf(k).find(x => x.id === id); if (!s) return;
+    const auto = s.source === 'auto';
     const t1 = new Date(s.start), t2 = new Date(s.end);
     const hm = d => d.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
     openSheet(`
@@ -806,10 +851,12 @@
         <div class="kpi"><div class="kpi__lbl">Distancia</div><div class="kpi__val num">${fmtKm(kmOf(s.steps))}<small> km</small></div></div>
         <div class="kpi"><div class="kpi__lbl">Ritmo</div><div class="kpi__val num">${s.seconds > 60 ? fmt(s.steps / (s.seconds / 60)) : '–'}<small> p/min</small></div></div>
       </div>
+      ${auto ? `<p class="sheet__sub" style="margin-top:14px">👟 Detectada automáticamente por el contador del móvil.</p><div class="sheet__actions"><button class="btn btn--soft" data-close>Cerrar</button></div>` : `
       <div class="sheet__actions">
         <button class="btn btn--danger" id="s-del">Eliminar</button>
         <button class="btn btn--soft" id="s-edit">Editar</button>
-      </div>`, sh => {
+      </div>`}`, sh => {
+      if (auto) return;
       $('#s-del', sh).onclick = () => { if (confirm('¿Eliminar este registro?')) { removeSession(k, id); save(); closeSheet(); render(); toast('Registro eliminado'); } };
       $('#s-edit', sh).onclick = () => { closeSheet(); manualSheet(s); };
     });
@@ -817,7 +864,7 @@
 
   function daySheet(k) {
     const d = parseKey(k), steps = daySteps(k), secs = daySecs(k), goal = S.settings.dailyGoal;
-    const ss = dayOf(k).sessions.slice().reverse();
+    const ss = sessionsOf(k).reverse();
     openSheet(`
       <h2 class="sheet__title" style="text-transform:capitalize">${d.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' })}</h2>
       <p class="sheet__sub">${steps >= goal ? '✓ Objetivo cumplido' : `${Math.round(steps / goal * 100)}% del objetivo`}</p>
@@ -871,7 +918,24 @@
   }
 
   // ================= Ajustes =================
-  const COLORS = ['#FF8A4C', '#7B61FF', '#19B394', '#FF5C9A', '#3BA6FF', '#F5B301'];
+  const COLORS = ['#FF8A4C', '#B39CFF', '#D29A66', '#FF5C9A', '#5FCB72', '#3BA6FF', '#F5B301', '#19B394'];
+  function avatarPicker(sel, color) {
+    return Object.entries(AVATARS).map(([id, a]) => `<button type="button" class="avatar-opt ${id === sel ? 'is-active' : ''}" data-av="${id}" aria-pressed="${id === sel}">
+      ${mascotSVG(id === sel ? 'party' : 'happy', id, id === sel ? color : a.color)}<span>${a.name}</span></button>`).join('');
+  }
+  function counterSettings() {
+    if (!Native) return `<p>El contador automático funciona en la app de Android. En el navegador puedes añadir los pasos a mano.</p>`;
+    if (!counter) return `<p>Comprobando el contador…</p>`;
+    const row = (ok, txt) => `<div class="check-row"><span class="${ok ? 'ok' : 'ko'}">${ok ? '✓' : '!'}</span>${txt}</div>`;
+    return `${row(counter.available, counter.available ? 'Tu móvil tiene contador de pasos' : 'Tu móvil no tiene contador de pasos')}
+      ${row(counter.permission === 'granted', counter.permission === 'granted' ? 'Permiso de actividad física concedido' : 'Falta el permiso de actividad física')}
+      ${row(counter.running, counter.running ? 'Contando en segundo plano' : 'El contador está parado')}
+      ${row(!counter.batteryOptimized, counter.batteryOptimized ? 'Android puede pararlo para ahorrar batería' : 'Sin restricciones de batería')}
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+        ${!counter.running || counter.permission !== 'granted' ? `<button class="btn btn--primary btn--sm" id="s-enable">Activar contador</button>` : ''}
+        ${counter.batteryOptimized ? `<button class="btn btn--soft btn--sm" id="s-battery">Quitar restricción de batería</button>` : ''}
+      </div>`;
+  }
   function milestoneEditor(key, label) {
     return `<div class="field"><label>${label}</label><div class="chips" data-ms="${key}">
       ${S.settings[key].slice().sort((a, b) => a - b).map(v => `<span class="chip">${fmtK(v)}<button type="button" data-rm="${v}" aria-label="Quitar ${fmt(v)}">✕</button></span>`).join('')}
@@ -902,12 +966,10 @@
 
       <div class="settings-group">
         <h3>🐾 Tu mascota</h3>
-        <div style="display:flex;gap:14px;align-items:center">
-          <div class="mascot-wrap" style="width:76px" id="s-mascot">${mascotSVG('happy')}</div>
-          <div style="flex:1">
-            <div class="field"><label for="s-mname">Nombre</label><input class="input" id="s-mname" maxlength="16" value="${esc(c.mascotName)}"></div>
-          </div>
-        </div>
+        <p>Elige quién te acompaña. Cada una celebra tus logros a su manera.</p>
+        <div class="avatars" id="s-avatars">${avatarPicker(c.avatar, c.mascotColor)}</div>
+        <div class="field" style="margin-top:14px"><label for="s-mname">Nombre</label><input class="input" id="s-mname" maxlength="16" value="${esc(c.mascotName)}"></div>
+        <label style="font-weight:800;font-size:14px;color:var(--ink-2);display:block;margin-bottom:8px">Color</label>
         <div class="swatches">${COLORS.map(col => `<button class="swatch ${col === c.mascotColor ? 'is-active' : ''}" data-col="${col}" style="background:${col}" aria-label="Color ${col}"></button>`).join('')}</div>
       </div>
 
@@ -922,9 +984,12 @@
       </div>
 
       <div class="settings-group">
-        <h3>📱 Sensor y apariencia</h3>
-        <div class="field"><label>Sensibilidad del contador</label><div class="chips" id="s-sens">${['baja', 'media', 'alta'].map(v => `<button type="button" class="chip ${c.sensitivity === v ? 'is-active' : ''}" data-v="${v}">${v[0].toUpperCase() + v.slice(1)}</button>`).join('')}</div>
-        <small>Si cuenta pasos de más, baja la sensibilidad; si se le escapan, súbela.</small></div>
+        <h3>📱 Contador automático</h3>
+        ${counterSettings()}
+      </div>
+
+      <div class="settings-group">
+        <h3>🎨 Apariencia</h3>
         <div class="field"><label>Tema</label><div class="chips" id="s-theme">${[['auto', 'Automático'], ['light', 'Claro'], ['dark', 'Oscuro']].map(([v, l]) => `<button type="button" class="chip ${c.theme === v ? 'is-active' : ''}" data-v="${v}">${l}</button>`).join('')}</div></div>
       </div>
 
@@ -940,7 +1005,10 @@
       </div>
 
       <div class="sheet__actions"><button class="btn btn--primary" id="s-save">Guardar cambios</button></div>`, sh => {
-      let color = c.mascotColor, sens = c.sensitivity, theme = c.theme;
+      let color = c.mascotColor, avatar = c.avatar, theme = c.theme;
+      const redrawAv = () => { $('#s-avatars', sh).innerHTML = avatarPicker(avatar, color); $$('.swatch', sh).forEach(x => x.classList.toggle('is-active', x.dataset.col === color)); };
+      const en = $('#s-enable', sh); if (en) en.onclick = () => { closeSheet(); enableCounter(); };
+      const bt = $('#s-battery', sh); if (bt) bt.onclick = () => { Native.openBatterySettings(); closeSheet(); setTimeout(() => refreshCounter().then(() => render({ soft: true })), 4000); };
       const ms = { dailyMilestones: [...c.dailyMilestones], weeklyMilestones: [...c.weeklyMilestones], totalMilestones: [...c.totalMilestones] };
       const redrawMs = key => {
         const box = $(`[data-ms="${key}"]`, sh);
@@ -959,9 +1027,9 @@
           return;
         }
         const sw = e.target.closest('[data-col]');
-        if (sw) { color = sw.dataset.col; $$('.swatch', sh).forEach(x => x.classList.toggle('is-active', x === sw)); $('#s-mascot', sh).innerHTML = mascotSVG('happy', color); return; }
-        const sv = e.target.closest('#s-sens [data-v]');
-        if (sv) { sens = sv.dataset.v; $$('#s-sens .chip', sh).forEach(x => x.classList.toggle('is-active', x === sv)); return; }
+        if (sw) { color = sw.dataset.col; redrawAv(); return; }
+        const av = e.target.closest('[data-av]');
+        if (av) { const nm = $('#s-mname', sh); if (!nm.value.trim() || nm.value.trim() === AVATARS[avatar].name) nm.value = AVATARS[av.dataset.av].name; avatar = av.dataset.av; color = AVATARS[avatar].color; redrawAv(); return; }
         const tv = e.target.closest('#s-theme [data-v]');
         if (tv) { theme = tv.dataset.v; $$('#s-theme .chip', sh).forEach(x => x.classList.toggle('is-active', x === tv)); applyTheme(theme); return; }
       });
@@ -985,12 +1053,13 @@
           weeklyGoal: clamp(Math.round(+$('#s-weekly', sh).value || 50000), 1000, 700000),
           name: $('#s-name', sh).value.trim(),
           mascotName: $('#s-mname', sh).value.trim() || 'Pipo',
-          mascotColor: color,
+          mascotColor: color, avatar,
           strideCm: clamp(+$('#s-stride', sh).value || 72, 30, 130),
           weightKg: clamp(+$('#s-weight', sh).value || 70, 25, 250),
-          sensitivity: sens, theme, ...ms,
+          theme, ...ms,
         });
         save(); closeSheet(); render(); toast('Ajustes guardados'); checkBadges();
+        if (Native) Native.setGoal({ goal: S.settings.dailyGoal }).catch(() => {});
       };
     });
   }
@@ -1002,30 +1071,43 @@
 
   // ================= Bienvenida =================
   function onboarding() {
+    let avatar = S.settings.avatar, goal = 8000;
     openSheet(`
       <div class="celebrate">
-        <div class="mascot-wrap">${mascotSVG('party')}</div>
+        <div class="mascot-wrap" id="o-hero">${mascotSVG('party', avatar, AVATARS[avatar].color)}</div>
         <div class="celebrate__kicker">Bienvenida a Pasito</div>
-        <h2>¡Hola! Soy ${esc(S.settings.mascotName)} 👋</h2>
-        <p>Te acompañaré en cada paso, celebraré tus hitos y te daré insignias. ¿Empezamos?</p>
+        <h2 id="o-hello">¡Hola! Soy ${esc(AVATARS[avatar].name)} 👋</h2>
+        <p>Contaré tus pasos solo, celebraré tus hitos y te daré insignias. ¿Quién quieres que te acompañe?</p>
       </div>
+      <div class="avatars" id="o-avatars" style="margin-top:14px">${avatarPicker(avatar, AVATARS[avatar].color)}</div>
       <div style="margin-top:18px">
         <div class="field"><label for="o-name">¿Cómo te llamas?</label><input class="input" id="o-name" maxlength="20" placeholder="Tu nombre (opcional)"></div>
         <div class="field"><label>¿Cuántos pasos quieres dar al día?</label>
           <div class="chips" id="o-goal">${[5000, 6000, 8000, 10000, 12000].map(v => `<button type="button" class="chip ${v === 8000 ? 'is-active' : ''}" data-v="${v}">${fmt(v)}</button>`).join('')}</div>
-          <small>La OMS y muchos estudios sitúan el beneficio claro entre 7.000 y 10.000 pasos. Lo puedes cambiar cuando quieras.</small>
+          <small>Muchos estudios sitúan un beneficio claro entre 7.000 y 10.000 pasos. Lo puedes cambiar cuando quieras.</small>
         </div>
       </div>
       <div class="sheet__actions" style="flex-direction:column">
-        <button class="btn btn--primary btn--block" id="o-go">¡Vamos a caminar!</button>
+        <button class="btn btn--primary btn--block" id="o-go">${Native ? '¡Empezar a contar pasos!' : '¡Vamos a caminar!'}</button>
         <button class="btn btn--soft btn--block" id="o-demo">Explorar con datos de ejemplo</button>
-      </div>`, sh => {
-      let goal = 8000;
+      </div>
+      ${Native ? `<p class="sheet__sub" style="text-align:center;margin-top:12px;font-size:12px">Te pediré permiso de actividad física para leer el contador de pasos del móvil. Tus datos no salen del teléfono.</p>` : ''}`, sh => {
       $('#o-goal', sh).onclick = e => { const b = e.target.closest('[data-v]'); if (!b) return; goal = +b.dataset.v; $$('#o-goal .chip', sh).forEach(x => x.classList.toggle('is-active', x === b)); };
+      $('#o-avatars', sh).onclick = e => {
+        const b = e.target.closest('[data-av]'); if (!b) return;
+        avatar = b.dataset.av; const a = AVATARS[avatar];
+        $('#o-avatars', sh).innerHTML = avatarPicker(avatar, a.color);
+        $('#o-hero', sh).innerHTML = mascotSVG('party', avatar, a.color);
+        $('#o-hello', sh).textContent = `¡Hola! Soy ${a.name} 👋`;
+      };
       const finish = demo => {
-        S.settings.name = $('#o-name', sh).value.trim(); S.settings.dailyGoal = goal; S.settings.weeklyGoal = Math.round(goal * 6.25 / 5000) * 5000;
-        S.settings.onboarded = true; save(); closeSheet();
+        Object.assign(S.settings, {
+          name: $('#o-name', sh).value.trim(), dailyGoal: goal, weeklyGoal: Math.round(goal * 6.25 / 5000) * 5000,
+          avatar, mascotName: AVATARS[avatar].name, mascotColor: AVATARS[avatar].color, onboarded: true,
+        });
+        save(); closeSheet();
         if (demo) loadDemo(); else render();
+        if (Native) enableCounter();
       };
       $('#o-go', sh).onclick = () => finish(false);
       $('#o-demo', sh).onclick = () => finish(true);
@@ -1036,23 +1118,32 @@
   function loadDemo() {
     if (allKeys().length && !confirm('Se añadirán 10 semanas de datos de ejemplo a tu historial. ¿Continuar?')) return;
     let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
-    const today = new Date();
+    const now = new Date(), nowMin = now.getHours() * 60 + now.getMinutes();
     for (let i = 70; i >= 0; i--) {
-      const d = addDays(today, -i); const k = keyOf(d);
-      if (S.days[k]) continue;
+      if (i === 0 && Native) continue; // hoy se cuentan los pasos reales
+      const d = addDays(now, -i), k = keyOf(d);
+      if (hasData(k)) continue;
+      if (rnd() < .06 && i > 0) continue;
       const wd = (d.getDay() + 6) % 7;
-      if (rnd() < .08 && i > 0) continue;
-      const base = (wd >= 5 ? 9500 : 7200) + (70 - i) * 25;
-      const n = 1 + Math.floor(rnd() * 3);
-      let target = i === 0 ? 4300 : base * (.45 + rnd() * 1.0);
-      for (let j = 0; j < n; j++) {
-        const steps = Math.round(target / n * (.7 + rnd() * .6));
-        const pace = 95 + rnd() * 25;
-        const secs = Math.round(steps / pace * 60);
-        const hour = [7, 13, 18, 20, 21][Math.floor(rnd() * 5)] + (j * 2) % 4;
-        const st = new Date(d); st.setHours(Math.min(hour, i === 0 ? Math.max(7, today.getHours() - 1) : 22), Math.floor(rnd() * 59));
-        if (i === 0 && st > today) st.setTime(today.getTime() - 3600000);
-        addSession(k, { id: `demo${k}${j}`, start: st.getTime(), end: st.getTime() + secs * 1000, steps, seconds: secs, source: rnd() < .8 ? 'sensor' : 'manual' });
+      const target = i === 0 ? 4300 : ((wd >= 5 ? 9500 : 7200) + (70 - i) * 25) * (.45 + rnd());
+      const day = ensureDay(k);
+      const put = (m, v) => { if (i === 0 && m > nowMin) return; day.auto[m] = (day.auto[m] || 0) + v; };
+      // pasos sueltos durante el día (casa, trabajo…)
+      let loose = target * .3;
+      while (loose > 0) { const m = 450 + Math.floor(rnd() * 900), v = 4 + Math.floor(rnd() * 10); put(m, v); loose -= v; }
+      // caminatas
+      let walk = target * .7;
+      const starts = [7 * 60 + 40, 13 * 60 + 50, 18 * 60 + 15, 20 * 60 + 40, 21 * 60 + 10];
+      let j = 0; const off = Math.floor(rnd() * 5);
+      while (walk > 300 && j < 4) {
+        const pace = 95 + rnd() * 25, mins = Math.max(5, Math.round(Math.min(walk, 2500 + rnd() * 5000) / pace));
+        const st = starts[(off + j) % starts.length] + Math.floor(rnd() * 20);
+        for (let m = 0; m < mins; m++) { const v = Math.round(pace * (.85 + rnd() * .3)); put(st + m, v); walk -= v; }
+        j++;
+      }
+      if (rnd() < .15 && i > 0) {
+        const t = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 11, 0).getTime();
+        addSession(k, { id: `demo${k}`, start: t, end: t + 1500000, steps: 2600, seconds: 1500, source: 'manual' });
       }
     }
     save(); render();
@@ -1088,18 +1179,33 @@
 
   // ================= Arranque =================
   $$('.tab').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));
-  $('#btn-settings').addEventListener('click', settingsSheet);
+  $('#btn-settings').addEventListener('click', () => refreshCounter().finally(settingsSheet));
   applyTheme(S.settings.theme);
   const h0 = location.hash.slice(1);
   setTab(views[h0] ? h0 : 'hoy');
-  if (S.live && !S.live.paused) { startSensor().then(ok => { if (S.live) S.live.sensor = ok; }); keepAwake(true); }
   if (!S.settings.onboarded) onboarding();
   else checkBadges();
+
+  if (Native) {
+    refreshCounter().then(async () => {
+      // Si ya estaba activado pero Android lo paró, lo volvemos a lanzar.
+      if (counter && counter.enabled && counter.permission === 'granted' && !counter.running) { try { counter = await Native.enable(); } catch { /* nada */ } }
+      if (S.settings.onboarded) Native.setGoal({ goal: S.settings.dailyGoal }).catch(() => {});
+      if (!$('.sheet')) render({ soft: true });
+      sync();
+    });
+    // Al volver a la app y cada 20 s mientras está abierta, recogemos los pasos nuevos.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') refreshCounter().then(() => { if (!$('.sheet')) render({ soft: true }); sync(); });
+    });
+    setInterval(() => { if (document.visibilityState === 'visible') sync(); }, 20000);
+  }
+
   // Cambio de día a medianoche
   let lastDay = todayKey();
-  setInterval(() => { if (todayKey() !== lastDay) { lastDay = todayKey(); if (!S.live) render(); } }, 60000);
+  setInterval(() => { if (todayKey() !== lastDay) { lastDay = todayKey(); if (!$('.sheet')) render({ soft: true }); } }, 60000);
 
-  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  if (!Native && 'serviceWorker' in navigator && location.protocol.startsWith('http')) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
 })();
