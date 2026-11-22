@@ -24,7 +24,7 @@ Los pasos se cuentan en el móvil en todo momento, pero se suben a la nube cuand
 El proyecto de Supabase es `pasito` (`https://gkdjsjlituvfnxosqdnb.supabase.co`). Su esquema está en `supabase/migrations/`. Cada usuario solo puede leer y escribir lo suyo; la administración puede leer todo.
 
 El servidor no se fía de lo que envía el móvil:
-- El nombre, el correo y la foto se copian de la cuenta de Google y no se pueden modificar.
+- El nombre registrado, el correo y la foto se copian de la cuenta de Google y no se pueden modificar. Aparte, cada persona elige cómo quiere que la app la llame (para el saludo) y lo puede cambiar cuando quiera; en el panel se ven los dos.
 - Los totales de cada día los calcula la base de datos a partir de los pasos minuto a minuto. Descarta los datos imposibles: más de 250 pasos en un minuto, registros a mano de más de 50.000 pasos o fechas futuras.
 - Los pasos añadidos a mano se guardan aparte (`manual_steps`) y el panel muestra qué parte de los pasos de cada persona son manuales.
 - Las insignias solo las concede el servidor (`refresh_badges`), comprobando los datos guardados. Nadie puede escribirlas directamente.

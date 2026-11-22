@@ -629,6 +629,7 @@
         <button class="item" data-uid="${u.user_id}">
           <div class="user-pic">${avatarOf(u)}</div>
           <div class="item__main"><div class="item__title">${esc(u.full_name || u.email || 'Sin nombre')}</div>
+            ${u.nickname && u.nickname !== (u.full_name || '').split(' ')[0] ? `<div class="item__sub">Le llamamos «${esc(u.nickname)}»</div>` : ''}
             <div class="item__sub">${esc(u.email || '')}</div>
             <div class="item__sub">Activo ${ago(u.last_seen_at)} · ${u.badges} insignias${Number(u.manual_steps_30d) > 0 ? ` · <span class="manual-tag">✍️ ${Math.round(100 * u.manual_steps_30d / Math.max(1, u.steps_30d))}% a mano</span>` : ''}</div></div>
           <div class="item__end num">${fmtK(Number(u.steps_7d) / 7)}<small>pasos/día</small></div>
@@ -650,6 +651,7 @@
     const manual = (data || []).reduce((a, r) => a + (r.manual_steps || 0), 0);
     openSheet(`
       <h2 class="sheet__title">${esc(u.full_name || u.email)}</h2>
+      ${u.nickname ? `<p class="sheet__sub" style="margin:0">Le llamamos «${esc(u.nickname)}»</p>` : ''}
       <p class="sheet__sub">${esc(u.email || '')} · desde ${new Date(u.created_at).toLocaleDateString('es-ES', { day: 'numeric', month: 'long', year: 'numeric' })}</p>
       <div class="card"><div class="kpi__lbl">Últimos 30 días</div>${barChart(days, goal)}</div>
       <div class="kpis" style="margin-top:12px">
@@ -661,6 +663,15 @@
         <div class="kpi"><div class="kpi__lbl">Mejor día</div><div class="kpi__val num">${fmtK(u.best_day)}</div><div class="kpi__sub">${u.badges} insignias</div></div>
       </div>
       <div class="sheet__actions"><button class="btn btn--soft" id="au-back">← Volver</button></div>`, sh => { $('#au-back', sh).onclick = adminPanel; });
+  }
+
+  const registeredName = () => (user && user.user_metadata && (user.user_metadata.full_name || user.user_metadata.name)) || '';
+  function registeredNameField() {
+    const n = registeredName();
+    if (!n) return '';
+    return `<div class="field"><label>Nombre registrado</label>
+      <div class="input input--locked" aria-readonly="true"><span>${esc(n)}</span><span aria-hidden="true">🔒</span></div>
+      <small>Es el nombre de tu cuenta de Google y no se puede cambiar.</small></div>`;
   }
 
   function accountSettings() {
@@ -1295,7 +1306,8 @@
 
       <div class="settings-group">
         <h3>🙂 Tú</h3>
-        <div class="field"><label for="s-name">Tu nombre</label><input class="input" id="s-name" maxlength="20" value="${esc(c.name)}" placeholder="¿Cómo te llamas?"></div>
+        ${registeredNameField()}
+        <div class="field"><label for="s-name">¿Cómo quieres que te llame?</label><input class="input" id="s-name" maxlength="20" value="${esc(c.name)}" placeholder="Por ejemplo: Mavi"><small>Es el nombre que usará ${esc(c.mascotName)} para saludarte. Puedes cambiarlo cuando quieras.</small></div>
         <div class="field-row">
           <div class="field"><label for="s-stride">Zancada (cm)</label><input class="input num" id="s-stride" type="number" min="30" max="130" value="${c.strideCm}"></div>
           <div class="field"><label for="s-weight">Peso (kg)</label><input class="input num" id="s-weight" type="number" min="25" max="250" value="${c.weightKg}"></div>
@@ -1417,7 +1429,8 @@
       </div>
       <div class="avatars" id="o-avatars" style="margin-top:14px">${avatarPicker(avatar, AVATARS[avatar].color)}</div>
       <div style="margin-top:18px">
-        <div class="field"><label for="o-name">¿Cómo te llamas?</label><input class="input" id="o-name" maxlength="20" placeholder="Tu nombre (opcional)" value="${esc(S.settings.name || '')}"></div>
+        ${registeredNameField()}
+        <div class="field"><label for="o-name">¿Cómo quieres que te llame?</label><input class="input" id="o-name" maxlength="20" placeholder="Por ejemplo: Mavi" value="${esc(S.settings.name || '')}"><small>Lo usaré para saludarte. Puedes cambiarlo cuando quieras.</small></div>
         <div class="field"><label>¿Cuántos pasos quieres dar al día?</label>
           <div class="chips" id="o-goal">${[5000, 6000, 8000, 10000, 12000].map(v => `<button type="button" class="chip ${v === 8000 ? 'is-active' : ''}" data-v="${v}">${fmt(v)}</button>`).join('')}</div>
           <small>Muchos estudios sitúan un beneficio claro entre 7.000 y 10.000 pasos. Lo puedes cambiar cuando quieras.</small>
