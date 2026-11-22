@@ -14,7 +14,26 @@ App de Android que cuenta tus pasos sola, en segundo plano, sin pulsar nada. Gua
 - **Color de fondo** a elegir (crema, cielo, menta, lavanda, rosa, limón o nube), con su versión para el tema oscuro.
 - **Añadir pasos a mano** para corregir o completar un día.
 
-Los datos se guardan solo en el móvil. En Ajustes se puede exportar e importar una copia de seguridad.
+- **Cuenta de Google y datos en la nube.** Cada persona entra con su cuenta de Google, tras aceptar el aviso de privacidad. Sus pasos, caminatas, insignias y ajustes se guardan en Supabase (servidores en París) y los recupera en cualquier móvil. La app funciona sin conexión y sube los datos al volver a tenerla. Desde Ajustes → Cuenta se puede cerrar sesión o borrar la cuenta con todos sus datos.
+- **Panel de administración.** Las cuentas marcadas como administración ven en Ajustes → Cuenta → **Ver usuarios** a todas las personas: pasos de los últimos 7 días, actividad, insignias y el detalle de 30 días de cada una.
+
+Los pasos se cuentan en el móvil en todo momento, pero se suben a la nube cuando se abre la app.
+
+## Configuración de Google y Supabase
+
+El proyecto de Supabase es `pasito` (`https://gkdjsjlituvfnxosqdnb.supabase.co`). Su esquema está en `supabase/migrations/`. Cada usuario solo puede leer y escribir lo suyo; la administración puede leer todo.
+
+Para que funcione "Continuar con Google" hay que configurar, una sola vez:
+
+1. **Google Cloud Console** → APIs y servicios:
+   - En *Pantalla de consentimiento de OAuth*, crea la app de tipo *Externa*. Mientras esté en modo *Prueba*, solo pueden entrar las cuentas que añadas como *usuarios de prueba* (hasta 100). Para que entre cualquiera, pulsa *Publicar app*.
+   - En *Credenciales* → *Crear credenciales* → *ID de cliente de OAuth* → tipo *Aplicación web*. En *URI de redirección autorizados* añade `https://gkdjsjlituvfnxosqdnb.supabase.co/auth/v1/callback`. Copia el ID de cliente y el secreto.
+2. **Supabase** → proyecto *pasito*:
+   - *Authentication* → *Sign In / Providers* → **Google**: actívalo y pega el ID de cliente y el secreto.
+   - *Authentication* → *URL Configuration* → *Redirect URLs*: añade `app.pasito.podometro://login` (y la dirección web de la app si la publicas).
+3. Para dar acceso de administración a otra cuenta: *SQL Editor* → `insert into public.admin_emails(email) values ('correo@gmail.com');`
+
+Para descargar todos los datos: *Table Editor* → `day_steps` (o `profiles`, `badges`) → *Export to CSV*.
 
 ## Instalar en Android
 
@@ -43,15 +62,17 @@ keyAlias=pasito
 keyPassword=…
 ```
 
-**Guarda bien el `.jks` y su contraseña.** Android solo deja actualizar la app si la nueva versión está firmada con la misma clave. Sin ella habría que desinstalar, y se perderían los datos (exporta antes una copia).
+**Guarda bien el `.jks` y su contraseña.** Android solo deja actualizar la app si la nueva versión está firmada con la misma clave. Sin ella habría que desinstalar la app; los datos no se pierden porque están en la cuenta de cada usuario.
 
-Para probar la interfaz en el navegador, sin contador automático: `npm run serve` y abre http://localhost:8000.
+Para probar la interfaz en el navegador, sin contador automático: `npm run serve` y abre http://localhost:8000. Para iniciar sesión desde ahí, añade `http://localhost:8000/` a las *Redirect URLs* de Supabase.
 
 ## Estructura
 
 | Ruta | Qué es |
 |---|---|
-| `www/` | La app: `index.html`, `styles.css` y `app.js` (vistas, insignias, mascotas, estadísticas) |
+| `www/` | La app: `index.html`, `styles.css` y `app.js` (vistas, insignias, mascotas, estadísticas, cuenta y nube) |
+| `www/vendor/supabase.js` | Cliente de Supabase (copiado de `@supabase/supabase-js`) |
+| `supabase/migrations/` | Tablas, reglas de seguridad y funciones de la base de datos |
 | `android/app/src/main/java/app/pasito/podometro/StepService.java` | Servicio en segundo plano que lee el contador de pasos del móvil |
 | `…/StepStore.java` | Base de datos de pasos por minuto |
 | `…/PasosPlugin.java` | Puente entre la app y el contador (permisos, sincronización, batería) |

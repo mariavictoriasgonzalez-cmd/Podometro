@@ -46,6 +46,8 @@
     days: {},
     badges: {},     // id -> { at, count }
     lastSync: 0,    // último minuto (desde epoch) sincronizado con el contador del móvil
+    owner: null,    // id de la cuenta a la que pertenecen estos datos
+    dirty: {},      // días pendientes de subir a la nube
   });
 
   let S = load();
@@ -55,6 +57,7 @@
       if (!raw) return defaults();
       const d = JSON.parse(raw), base = defaults();
       delete d.live;
+      if (!d.dirty) d.dirty = {};
       return { ...base, ...d, settings: { ...base.settings, ...(d.settings || {}) } };
     } catch { return defaults(); }
   }
@@ -78,6 +81,7 @@
     const d = ensureDay(k);
     d.sessions.push(sess);
     d.sessions.sort((a, b) => a.start - b.start);
+    markDirty(k);
   }
 
   // Caminatas detectadas solas: minutos seguidos caminando (huecos de hasta 2 min), de 5 min o más.
@@ -330,7 +334,7 @@
       if (b.count > 0 && !had) { S.badges[b.id] = { at: Date.now(), count: b.count }; fresh.push(b); }
       else if (had) had.count = b.count;
     }
-    if (fresh.length) { save(); if (!silent) celebrate(fresh); }
+    if (fresh.length) { S.badgesDirty = true; save(); schedulePush(); if (!silent) celebrate(fresh); }
     return fresh;
   }
 
@@ -366,7 +370,7 @@
       for (const [m, steps] of res.buckets || []) {
         const d = new Date(m * 60000), k = keyOf(d), mod = d.getHours() * 60 + d.getMinutes();
         const day = ensureDay(k);
-        if (day.auto[mod] !== steps) { day.auto[mod] = steps; changed = true; }
+        if (day.auto[mod] !== steps) { day.auto[mod] = steps; changed = true; markDirty(k); }
       }
       S.lastSync = res.now;
       save();
@@ -385,6 +389,289 @@
       toast('Sin el permiso de actividad física no puedo contar pasos. Puedes darlo en Ajustes del móvil.');
     }
     render();
+  }
+
+  // ================= Cuenta (Google) y nube =================
+  // Cada usuario entra con Google; sus datos se guardan en Supabase y solo él (y la administración) los puede leer.
+  const SB_URL = 'https://gkdjsjlituvfnxosqdnb.supabase.co';
+  const SB_KEY = 'sb_publishable_6OrcZBlwbz5kO0zU01PBWA_ZiZFq4OV'; // clave pública: la seguridad la ponen las reglas de la base de datos
+  const REDIRECT_NATIVE = 'app.pasito.podometro://login';
+  const sb = window.supabase ? window.supabase.createClient(SB_URL, SB_KEY, {
+    auth: { flowType: 'pkce', persistSession: true, autoRefreshToken: true, detectSessionInUrl: !Native },
+  }) : null;
+  const CapApp = Native ? window.Capacitor.Plugins.App : null;
+  const CapBrowser = Native ? window.Capacitor.Plugins.Browser : null;
+
+  let user = null, isAdmin = false, cloudState = 'idle'; // idle | syncing | ok | offline | error
+  let pushTimer = null, pushing = false;
+
+  const markDirty = k => { if (!S.dirty) S.dirty = {}; S.dirty[k] = 1; schedulePush(); };
+  function schedulePush(ms = 2500) { if (!user) return; clearTimeout(pushTimer); pushTimer = setTimeout(pushCloud, ms); }
+
+  function wipeLocal() {
+    const keepSync = Math.floor(Date.now() / 60000); // los pasos del móvil anteriores a este momento no son del nuevo usuario
+    S = defaults(); S.lastSync = keepSync; save(); walkCache.clear();
+  }
+
+  async function signInWithGoogle() {
+    if (!sb) { toast('No se pudo cargar el inicio de sesión. Revisa la conexión.'); return; }
+    if (Native) {
+      const { data, error } = await sb.auth.signInWithOAuth({
+        provider: 'google',
+        options: { redirectTo: REDIRECT_NATIVE, skipBrowserRedirect: true, queryParams: { prompt: 'select_account' } },
+      });
+      if (error || !data || !data.url) throw error || new Error('sin url');
+      await CapBrowser.open({ url: data.url, presentationStyle: 'popover' });
+    } else {
+      const { error } = await sb.auth.signInWithOAuth({
+        provider: 'google',
+        options: { redirectTo: location.origin + location.pathname, queryParams: { prompt: 'select_account' } },
+      });
+      if (error) throw error;
+    }
+  }
+
+  // Vuelta desde el navegador tras elegir la cuenta de Google (app de Android)
+  if (CapApp) {
+    CapApp.addListener('appUrlOpen', async ({ url }) => {
+      if (!url || !url.startsWith(REDIRECT_NATIVE)) return;
+      try { CapBrowser.close(); } catch { /* ya cerrado */ }
+      const u = new URL(url);
+      const code = u.searchParams.get('code');
+      const err = u.searchParams.get('error_description') || u.searchParams.get('error');
+      if (err) { loginError(err); return; }
+      if (!code) return;
+      const { error } = await sb.auth.exchangeCodeForSession(code);
+      if (error) loginError(error.message);
+    });
+  }
+
+  async function onSignedIn(u) {
+    const first = !user || user.id !== u.id;
+    user = u;
+    if (!first) return;
+    // Si en este móvil había datos de otra persona, se borran antes de cargar los tuyos.
+    if (S.owner && S.owner !== u.id) wipeLocal();
+    const adopting = !S.owner;      // datos locales de antes de tener cuenta: pasan a ser tuyos
+    S.owner = u.id;
+    if (adopting) { S.dirty = {}; for (const k of allKeys()) S.dirty[k] = 1; S.settingsDirty = true; S.badgesDirty = true; }
+    if (!S.settings.name) S.settings.name = ((u.user_metadata && (u.user_metadata.full_name || u.user_metadata.name)) || '').split(' ')[0];
+    save();
+    closeLogin();
+    try { const r = await sb.rpc('is_admin'); isAdmin = r.data === true; } catch { isAdmin = false; }
+    await pullCloud();
+    if (!S.settings.onboarded) onboarding(); else render({ soft: true });
+    pushCloud();
+  }
+
+  async function pullCloud() {
+    if (!user) return;
+    cloudState = 'syncing';
+    try {
+      const [{ data: prof, error: e1 }, { data: bdg, error: e2 }] = await Promise.all([
+        sb.from('profiles').select('settings, consent_at').eq('id', user.id).maybeSingle(),
+        sb.from('badges').select('badge_id, unlocked_at, count').eq('user_id', user.id),
+      ]);
+      if (e1 || e2) throw e1 || e2;
+      // días, en páginas de 1000
+      let from = 0; const rows = [];
+      for (;;) {
+        const { data, error } = await sb.from('day_steps').select('day, auto, manual').eq('user_id', user.id).order('day').range(from, from + 999);
+        if (error) throw error;
+        rows.push(...data); if (data.length < 1000) break; from += 1000;
+      }
+      for (const r of rows) {
+        const d = ensureDay(r.day); let localNewer = false;
+        for (const [m, v] of Object.entries(r.auto || {})) { if ((d.auto[m] || 0) < v) d.auto[m] = v; }
+        for (const [m, v] of Object.entries(d.auto)) { if ((r.auto || {})[m] !== v) localNewer = true; }
+        const ids = new Set(d.sessions.map(s => s.id));
+        for (const s of r.manual || []) if (!ids.has(s.id)) d.sessions.push(s);
+        if (d.sessions.length !== (r.manual || []).length) localNewer = true;
+        d.sessions.sort((a, b) => a.start - b.start);
+        if (localNewer) S.dirty[r.day] = 1;
+      }
+      const remoteSet = prof && prof.settings && Object.keys(prof.settings).length;
+      if (remoteSet && !S.settings.onboarded) S.settings = { ...defaults().settings, ...prof.settings, hideTips: S.settings.hideTips, onboarded: true };
+      else if (!remoteSet && S.settings.onboarded) S.settingsDirty = true;
+      if (prof && !prof.consent_at) S.consentDirty = true;
+      for (const b of bdg || []) if (!S.badges[b.badge_id]) S.badges[b.badge_id] = { at: new Date(b.unlocked_at).getTime(), count: b.count };
+      walkCache.clear();
+      S.lastPull = Date.now();
+      save(); applyTheme();
+      cloudState = 'ok';
+    } catch { cloudState = navigator.onLine === false ? 'offline' : 'error'; }
+  }
+
+  async function pushCloud() {
+    if (!user || pushing || S.demo) return;
+    pushing = true; cloudState = 'syncing';
+    try {
+      const keys = Object.keys(S.dirty || {});
+      for (let i = 0; i < keys.length; i += 100) {
+        const chunk = keys.slice(i, i + 100);
+        const rows = chunk.map(k => ({
+          user_id: user.id, day: k, steps: Math.min(500000, daySteps(k)), active_seconds: Math.min(86400, daySecs(k)),
+          auto: autoOf(k), manual: manualOf(k), updated_at: new Date().toISOString(),
+        }));
+        const { error } = await sb.from('day_steps').upsert(rows, { onConflict: 'user_id,day' });
+        if (error) throw error;
+        chunk.forEach(k => delete S.dirty[k]);
+      }
+      const prof = { last_seen_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+      if (S.settingsDirty) { const { hideTips, ...rest } = S.settings; prof.settings = rest; }
+      if (S.consentDirty) prof.consent_at = new Date().toISOString();
+      const { error: pe } = await sb.from('profiles').update(prof).eq('id', user.id);
+      if (pe) throw pe;
+      S.settingsDirty = false; S.consentDirty = false;
+      if (S.badgesDirty) {
+        const rows = Object.entries(S.badges).map(([id, b]) => ({ user_id: user.id, badge_id: id, unlocked_at: new Date(b.at).toISOString(), count: b.count || 1 }));
+        if (rows.length) { const { error } = await sb.from('badges').upsert(rows, { onConflict: 'user_id,badge_id' }); if (error) throw error; }
+        S.badgesDirty = false;
+      }
+      S.lastPush = Date.now(); save();
+      cloudState = 'ok';
+    } catch { cloudState = navigator.onLine === false ? 'offline' : 'error'; schedulePush(60000); }
+    finally { pushing = false; }
+  }
+
+  async function signOut() {
+    await pushCloud();
+    if (Object.keys(S.dirty || {}).length && !confirm('Hay pasos que aún no se han guardado en tu cuenta (¿sin conexión?). Si cierras sesión ahora se perderán. ¿Cerrar sesión igualmente?')) return;
+    try { await sb.auth.signOut(); } catch { /* sin conexión */ }
+    user = null; isAdmin = false; wipeLocal(); closeSheet(); render(); showLogin();
+  }
+
+  async function deleteAccount() {
+    if (!confirm('¿Borrar tu cuenta? Se eliminarán para siempre todos tus pasos, caminatas e insignias.')) return;
+    if (!confirm('Última confirmación: esta acción no se puede deshacer.')) return;
+    const { error } = await sb.rpc('delete_my_account');
+    if (error) { toast('No se pudo borrar la cuenta. Revisa la conexión e inténtalo de nuevo.'); return; }
+    try { await sb.auth.signOut({ scope: 'local' }); } catch { /* nada */ }
+    user = null; isAdmin = false; wipeLocal(); closeSheet(); render(); showLogin();
+    toast('Tu cuenta y tus datos se han borrado');
+  }
+
+  // ----- Pantalla de acceso -----
+  function showLogin() {
+    if ($('#login')) return;
+    const el = document.createElement('div');
+    el.id = 'login'; el.className = 'login';
+    el.innerHTML = `
+      <div class="login__card">
+        <div class="mascot-wrap login__mascot">${mascotSVG('party', S.settings.avatar, S.settings.mascotColor)}</div>
+        <h1 class="login__title">Pasito</h1>
+        <p class="login__sub">Cuenta tus pasos, gana insignias y guarda tu historial en tu cuenta.</p>
+        <label class="consent"><input type="checkbox" id="l-consent"><span>Acepto que Pasito guarde mis pasos, mi actividad y mi nombre de Google en mi cuenta para mostrarme mi historial. <button type="button" class="link-btn" id="l-privacy">Ver privacidad</button></span></label>
+        <button class="btn btn--google btn--block" id="l-google" disabled>
+          <svg viewBox="0 0 48 48" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.4-.4-3.5z"/></svg>
+          Continuar con Google
+        </button>
+        <p class="login__msg" id="l-msg" role="status"></p>
+      </div>`;
+    document.body.appendChild(el);
+    const cb = $('#l-consent', el), go = $('#l-google', el);
+    cb.onchange = () => { go.disabled = !cb.checked; };
+    $('#l-privacy', el).onclick = privacySheet;
+    go.onclick = async () => {
+      go.disabled = true; $('#l-msg', el).textContent = 'Abriendo Google…';
+      try { await signInWithGoogle(); $('#l-msg', el).textContent = 'Elige tu cuenta de Google para continuar.'; }
+      catch { loginError('No se pudo conectar. Revisa tu conexión a internet.'); }
+      finally { setTimeout(() => { go.disabled = !cb.checked; }, 1500); }
+    };
+  }
+  function closeLogin() { const el = $('#login'); if (el) el.remove(); }
+  function loginError(msg) { const m = $('#l-msg'); if (m) m.textContent = 'No se pudo iniciar sesión: ' + msg; }
+
+  function privacySheet() {
+    openSheet(`
+      <h2 class="sheet__title">Privacidad</h2>
+      <div class="prose">
+        <p><strong>Qué guardamos:</strong> tu nombre, correo y foto de Google; tus pasos minuto a minuto, caminatas, registros manuales, insignias y ajustes de la app.</p>
+        <p><strong>Para qué:</strong> para mostrarte tu historial y tus estadísticas en cualquier móvil donde entres. La administración de Pasito puede ver estos datos para cuidar y mejorar la app. No se venden ni se comparten con terceros.</p>
+        <p><strong>Dónde:</strong> en una base de datos de Supabase alojada en la Unión Europea (París). Cada persona solo puede acceder a sus propios datos.</p>
+        <p><strong>Durante cuánto tiempo:</strong> mientras tengas la cuenta. Puedes borrarla con todos sus datos desde Ajustes → Cuenta → Borrar mi cuenta.</p>
+        <p><strong>Tus derechos:</strong> puedes acceder a tus datos, corregirlos o borrarlos cuando quieras. Para cualquier duda, contacta con la administración de Pasito.</p>
+      </div>
+      <div class="sheet__actions"><button class="btn btn--soft" data-close>Entendido</button></div>`);
+  }
+
+  // ----- Panel de administración -----
+  const ago = ts => {
+    if (!ts) return 'nunca';
+    const m = Math.round((Date.now() - new Date(ts).getTime()) / 60000);
+    return m < 2 ? 'ahora' : m < 60 ? `hace ${m} min` : m < 1440 ? `hace ${Math.round(m / 60)} h` : `hace ${Math.round(m / 1440)} d`;
+  };
+  async function adminPanel() {
+    openSheet(`<h2 class="sheet__title">Usuarios</h2><p class="sheet__sub">Cargando…</p>`);
+    const { data, error } = await sb.rpc('admin_user_stats');
+    if (!$('.sheet')) return;
+    if (error) { $('.sheet').innerHTML = `<div class="sheet__grab"></div><h2 class="sheet__title">Usuarios</h2><p class="sheet__sub">No se pudieron cargar los datos.</p><div class="sheet__actions"><button class="btn btn--soft" data-close>Cerrar</button></div>`; return; }
+    const users = data || [];
+    const active7 = users.filter(u => u.steps_7d > 0).length;
+    const steps7 = users.reduce((a, u) => a + Number(u.steps_7d), 0);
+    const total = users.reduce((a, u) => a + Number(u.total_steps), 0);
+    const avatarOf = u => u.photo ? `<img src="${esc(u.photo)}" alt="" referrerpolicy="no-referrer">` : `<div class="mascot-wrap">${mascotSVG('happy', AVATARS[u.avatar] ? u.avatar : 'pipo', (AVATARS[u.avatar] || AVATARS.pipo).color)}</div>`;
+    $('.sheet').innerHTML = `<div class="sheet__grab"></div>
+      <h2 class="sheet__title">Usuarios</h2>
+      <p class="sheet__sub">Solo tú ves este panel.</p>
+      <div class="kpis" style="grid-template-columns:repeat(3,1fr)">
+        <div class="kpi"><div class="kpi__lbl">Usuarios</div><div class="kpi__val num" style="font-size:20px">${users.length}</div><div class="kpi__sub">${active7} activos (7 d)</div></div>
+        <div class="kpi"><div class="kpi__lbl">Pasos 7 d</div><div class="kpi__val num" style="font-size:20px">${fmtK(steps7)}</div><div class="kpi__sub">${active7 ? fmtK(steps7 / active7 / 7) + '/día' : '–'}</div></div>
+        <div class="kpi"><div class="kpi__lbl">Total</div><div class="kpi__val num" style="font-size:20px">${fmtK(total)}</div><div class="kpi__sub">${fmtKm(kmOf(total))} km</div></div>
+      </div>
+      <div class="section-title" style="margin-top:18px">Todas las personas <small>últimos 7 días</small></div>
+      <div class="list">${users.map(u => `
+        <button class="item" data-uid="${u.user_id}">
+          <div class="user-pic">${avatarOf(u)}</div>
+          <div class="item__main"><div class="item__title">${esc(u.full_name || u.email || 'Sin nombre')}</div>
+            <div class="item__sub">${esc(u.email || '')}</div>
+            <div class="item__sub">Activo ${ago(u.last_seen_at)} · ${u.badges} insignias</div></div>
+          <div class="item__end num">${fmtK(Number(u.steps_7d) / 7)}<small>pasos/día</small></div>
+        </button>`).join('') || '<div class="empty">Todavía no hay usuarios.</div>'}</div>
+      <p class="sheet__sub" style="margin-top:14px;font-size:12px">Para descargar todos los datos en Excel/CSV: panel de Supabase → Table Editor → day_steps → Export.</p>
+      <div class="sheet__actions"><button class="btn btn--soft" data-close>Cerrar</button></div>`;
+    $('.sheet').onclick = e => { const b = e.target.closest('[data-uid]'); if (b) adminUser(users.find(u => u.user_id === b.dataset.uid)); };
+  }
+
+  async function adminUser(u) {
+    if (!u) return;
+    const since = keyOf(addDays(new Date(), -29));
+    const { data } = await sb.from('day_steps').select('day, steps, active_seconds').eq('user_id', u.user_id).gte('day', since).order('day');
+    const byDay = Object.fromEntries((data || []).map(r => [r.day, r]));
+    const days = [];
+    for (let i = 29; i >= 0; i--) { const d = addDays(new Date(), -i), k = keyOf(d); days.push({ d, k, steps: byDay[k] ? byDay[k].steps : 0, secs: byDay[k] ? byDay[k].active_seconds : 0 }); }
+    const goal = u.daily_goal || 8000;
+    const sum = days.reduce((a, x) => a + x.steps, 0), secs = days.reduce((a, x) => a + x.secs, 0);
+    openSheet(`
+      <h2 class="sheet__title">${esc(u.full_name || u.email)}</h2>
+      <p class="sheet__sub">${esc(u.email || '')} · desde ${new Date(u.created_at).toLocaleDateString('es-ES', { day: 'numeric', month: 'long', year: 'numeric' })}</p>
+      <div class="card"><div class="kpi__lbl">Últimos 30 días</div>${barChart(days, goal)}</div>
+      <div class="kpis" style="margin-top:12px">
+        <div class="kpi"><div class="kpi__lbl">Media diaria</div><div class="kpi__val num">${fmt(sum / 30)}</div><div class="kpi__sub">objetivo ${fmtK(goal)}</div></div>
+        <div class="kpi"><div class="kpi__lbl">Tiempo caminando</div><div class="kpi__val num">${fmtDur(secs / 30)}</div><div class="kpi__sub">al día</div></div>
+        <div class="kpi"><div class="kpi__lbl">Total histórico</div><div class="kpi__val num">${fmtK(Number(u.total_steps))}</div><div class="kpi__sub">${u.days_active} días con pasos</div></div>
+        <div class="kpi"><div class="kpi__lbl">Mejor día</div><div class="kpi__val num">${fmtK(u.best_day)}</div><div class="kpi__sub">${u.badges} insignias</div></div>
+      </div>
+      <div class="sheet__actions"><button class="btn btn--soft" id="au-back">← Volver</button></div>`, sh => { $('#au-back', sh).onclick = adminPanel; });
+  }
+
+  function accountSettings() {
+    if (!sb) return '<p>Sin conexión con el servidor.</p>';
+    if (!user) return '<p>No has iniciado sesión.</p>';
+    const m = user.user_metadata || {};
+    const st = { ok: '✓ Guardado en tu cuenta', syncing: 'Guardando…', offline: 'Sin conexión: se guardará al volver', error: 'No se pudo guardar; se reintentará', idle: '' }[cloudState];
+    return `
+      <div class="account">
+        ${m.avatar_url ? `<img src="${esc(m.avatar_url)}" alt="" referrerpolicy="no-referrer">` : '<div class="account__ph">👤</div>'}
+        <div style="min-width:0"><div class="item__title">${esc(m.full_name || m.name || 'Tu cuenta')}</div><div class="item__sub">${esc(user.email || '')}</div>
+        <div class="item__sub" style="color:${cloudState === 'ok' ? 'var(--mint)' : 'var(--muted)'}">${st}${S.lastPush ? ' · ' + ago(S.lastPush) : ''}</div></div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+        ${isAdmin ? '<button class="btn btn--primary btn--sm" id="s-admin">👑 Ver usuarios</button>' : ''}
+        <button class="btn btn--soft btn--sm" id="s-privacy">Privacidad</button>
+        <button class="btn btn--soft btn--sm" id="s-logout">Cerrar sesión</button>
+        <button class="btn btn--danger btn--sm" id="s-delete">Borrar mi cuenta</button>
+      </div>`;
   }
 
   // ================= UI general =================
@@ -851,7 +1138,7 @@
   function removeSession(k, id) {
     if (!S.days[k]) return;
     S.days[k].sessions = S.days[k].sessions.filter(s => s.id !== id);
-    if (!hasData(k)) delete S.days[k];
+    markDirty(k);
   }
 
   function sessionSheet(k, id) {
@@ -970,6 +1257,8 @@
       <h2 class="sheet__title">Ajustes</h2>
       <p class="sheet__sub">Personaliza tus objetivos, tu mascota y tus hitos.</p>
 
+      ${user ? `<div class="settings-group"><h3>👤 Cuenta</h3>${accountSettings()}</div>` : ''}
+
       <div class="settings-group">
         <h3>🎯 Objetivos</h3>
         <div class="field"><label for="s-daily">Objetivo diario (pasos)</label>
@@ -1016,7 +1305,7 @@
         <div class="field"><label>Tema</label><div class="chips" id="s-theme">${[['auto', 'Automático'], ['light', 'Claro'], ['dark', 'Oscuro']].map(([v, l]) => `<button type="button" class="chip ${c.theme === v ? 'is-active' : ''}" data-v="${v}">${l}</button>`).join('')}</div></div>
       </div>
 
-      <div class="settings-group">
+      ${user ? '' : `<div class="settings-group">
         <h3>💾 Tus datos</h3>
         <p>Todo se guarda solo en este dispositivo. Haz copias de seguridad de vez en cuando.</p>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -1025,7 +1314,7 @@
           <button class="btn btn--soft btn--sm" id="s-demo">Datos de ejemplo</button>
           <button class="btn btn--danger btn--sm" id="s-reset">Borrar todo</button>
         </div>
-      </div>
+      </div>`}
 
       <div class="sheet__actions"><button class="btn btn--primary" id="s-save">Guardar cambios</button></div>`, sh => {
       let color = c.mascotColor, avatar = c.avatar, theme = c.theme, bg = c.bg || 'crema';
@@ -1058,6 +1347,12 @@
         const bv = e.target.closest('#s-bg [data-bg]');
         if (bv) { bg = bv.dataset.bg; $$('#s-bg .bg-swatch', sh).forEach(x => { x.classList.toggle('is-active', x === bv); x.setAttribute('aria-pressed', x === bv); }); applyTheme(theme, bg); return; }
       });
+      const on = (id, fn) => { const el = $(id, sh); if (el) el.onclick = fn; };
+      on('#s-admin', () => adminPanel());
+      on('#s-privacy', () => privacySheet());
+      on('#s-logout', () => signOut());
+      on('#s-delete', () => deleteAccount());
+      if ($('#s-export', sh)) {
       $('#s-export', sh).onclick = () => {
         const blob = new Blob([JSON.stringify(S, null, 2)], { type: 'application/json' });
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `pasito-copia-${todayKey()}.json`; a.click();
@@ -1072,6 +1367,7 @@
       $('#s-reset', sh).onclick = () => {
         if (confirm('¿Seguro? Se borrarán todos tus pasos, historial e insignias.')) { const keep = S.settings; S = defaults(); S.settings = { ...keep }; save(); closeSheet(); render(); toast('Datos borrados'); }
       };
+      }
       $('#s-save', sh).onclick = () => {
         Object.assign(S.settings, {
           dailyGoal: clamp(Math.round(+$('#s-daily', sh).value || 8000), 500, 100000),
@@ -1083,7 +1379,7 @@
           weightKg: clamp(+$('#s-weight', sh).value || 70, 25, 250),
           theme, bg, ...ms,
         });
-        save(); closeSheet(); render(); toast('Ajustes guardados'); checkBadges();
+        S.settingsDirty = true; save(); schedulePush(500); closeSheet(); render(); toast('Ajustes guardados'); checkBadges();
         if (Native) Native.setGoal({ goal: S.settings.dailyGoal }).catch(() => {});
       };
     });
@@ -1112,7 +1408,7 @@
       </div>
       <div class="avatars" id="o-avatars" style="margin-top:14px">${avatarPicker(avatar, AVATARS[avatar].color)}</div>
       <div style="margin-top:18px">
-        <div class="field"><label for="o-name">¿Cómo te llamas?</label><input class="input" id="o-name" maxlength="20" placeholder="Tu nombre (opcional)"></div>
+        <div class="field"><label for="o-name">¿Cómo te llamas?</label><input class="input" id="o-name" maxlength="20" placeholder="Tu nombre (opcional)" value="${esc(S.settings.name || '')}"></div>
         <div class="field"><label>¿Cuántos pasos quieres dar al día?</label>
           <div class="chips" id="o-goal">${[5000, 6000, 8000, 10000, 12000].map(v => `<button type="button" class="chip ${v === 8000 ? 'is-active' : ''}" data-v="${v}">${fmt(v)}</button>`).join('')}</div>
           <small>Muchos estudios sitúan un beneficio claro entre 7.000 y 10.000 pasos. Lo puedes cambiar cuando quieras.</small>
@@ -1120,7 +1416,7 @@
       </div>
       <div class="sheet__actions" style="flex-direction:column">
         <button class="btn btn--primary btn--block" id="o-go">${Native ? '¡Empezar a contar pasos!' : '¡Vamos a caminar!'}</button>
-        <button class="btn btn--soft btn--block" id="o-demo">Explorar con datos de ejemplo</button>
+        ${user ? '' : '<button class="btn btn--soft btn--block" id="o-demo">Explorar con datos de ejemplo</button>'}
       </div>
       ${Native ? `<p class="sheet__sub" style="text-align:center;margin-top:12px;font-size:12px">Te pediré permiso de actividad física para leer el contador de pasos del móvil. Tus datos no salen del teléfono.</p>` : ''}`, sh => {
       $('#o-goal', sh).onclick = e => { const b = e.target.closest('[data-v]'); if (!b) return; goal = +b.dataset.v; $$('#o-goal .chip', sh).forEach(x => x.classList.toggle('is-active', x === b)); };
@@ -1136,12 +1432,12 @@
           name: $('#o-name', sh).value.trim(), dailyGoal: goal, weeklyGoal: Math.round(goal * 6.25 / 5000) * 5000,
           avatar, mascotName: AVATARS[avatar].name, mascotColor: AVATARS[avatar].color, onboarded: true,
         });
-        save(); closeSheet();
+        S.settingsDirty = true; save(); closeSheet(); schedulePush(500);
         if (demo) loadDemo(); else render();
         if (Native) enableCounter();
       };
       $('#o-go', sh).onclick = () => finish(false);
-      $('#o-demo', sh).onclick = () => finish(true);
+      const od = $('#o-demo', sh); if (od) od.onclick = () => finish(true);
     });
   }
 
@@ -1177,7 +1473,7 @@
         addSession(k, { id: `demo${k}`, start: t, end: t + 1500000, steps: 2600, seconds: 1500, source: 'manual' });
       }
     }
-    save(); render();
+    S.demo = true; save(); render();
     checkBadges({ silent: true });
     toast('Datos de ejemplo cargados. ¡Echa un vistazo a Historial y Logros!');
   }
@@ -1214,7 +1510,15 @@
   applyTheme();
   const h0 = location.hash.slice(1);
   setTab(views[h0] ? h0 : 'hoy');
-  if (!S.settings.onboarded) onboarding();
+  if (sb) {
+    // Hace falta una cuenta: al entrar se cargan tus datos; sin sesión se muestra la pantalla de acceso.
+    sb.auth.onAuthStateChange((ev, session) => {
+      if (session && session.user) setTimeout(() => onSignedIn(session.user), 0);
+    });
+    sb.auth.getSession().then(({ data }) => { if (!data.session) showLogin(); });
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') pushCloud(); });
+    window.addEventListener('online', () => pushCloud());
+  } else if (!S.settings.onboarded) onboarding();
   else checkBadges();
 
   if (Native) {

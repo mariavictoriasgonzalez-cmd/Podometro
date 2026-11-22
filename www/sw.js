@@ -1,6 +1,6 @@
 // Service worker: permite usar Pasito sin conexión.
-const CACHE = 'pasito-v1';
-const ASSETS = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png'];
+const CACHE = 'pasito-v3';
+const ASSETS = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'vendor/supabase.js'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
@@ -10,7 +10,8 @@ self.addEventListener('activate', e => {
 });
 // Red primero (para recibir actualizaciones), caché como respaldo.
 self.addEventListener('fetch', e => {
-  if (e.request.method !== 'GET') return;
+  // Solo los archivos de la propia app; las llamadas a otros servidores (Supabase, Google) pasan sin tocar.
+  if (e.request.method !== 'GET' || new URL(e.request.url).origin !== location.origin) return;
   e.respondWith(
     fetch(e.request).then(r => {
       if (r.ok && new URL(e.request.url).origin === location.origin) {
