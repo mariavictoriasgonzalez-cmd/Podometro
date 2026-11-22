@@ -1,6 +1,6 @@
 # 👟 Pasito · Podómetro
 
-App de Android que cuenta tus pasos sola, en segundo plano, sin pulsar nada. Guarda el historial y las estadísticas, y tiene una mascota (a elegir entre cinco) que te anima. Tus hitos te dan insignias.
+App de Android que cuenta tus pasos sola, en segundo plano, sin pulsar nada. Guarda el historial y las estadísticas, y tiene una mascota (a elegir entre seis) que te anima. Tus hitos te dan insignias.
 
 ## Qué hace
 
@@ -10,7 +10,8 @@ App de Android que cuenta tus pasos sola, en segundo plano, sin pulsar nada. Gua
 - **Historial:** calendario de calor por mes y lista de días agrupados por semanas.
 - **Estadísticas** (7 días, 30 días o 3 meses): pasos por día con la línea del objetivo, comparación con el periodo anterior, día favorito de la semana, franja horaria y récords.
 - **Logros:** niveles e insignias por hitos diarios, retos semanales, pasos acumulados, rachas y logros especiales. **Todos los hitos se pueden ajustar.**
-- **Mascotas:** Pipo, Misi (gata), Toby (perro), Copo (pingüino) y Rex (dino). Se les puede cambiar el nombre y el color. Cambian de humor según tu día: duermen, te saludan, caminan contigo y celebran tus objetivos.
+- **Mascotas:** Pipo, Misi (gata), Toby (perro), Copo (pingüino), Rex (dino) y Luna (unicornio). Se les puede cambiar el nombre y el color.
+- **Color de fondo** a elegir (crema, cielo, menta, lavanda, rosa, limón o nube), con su versión para el tema oscuro. Cambian de humor según tu día: duermen, te saludan, caminan contigo y celebran tus objetivos.
 - **Añadir pasos a mano** para corregir o completar un día.
 
 Los datos se guardan solo en el móvil. En Ajustes se puede exportar e importar una copia de seguridad.

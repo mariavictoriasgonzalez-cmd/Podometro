@@ -35,6 +35,7 @@
       strideCm: 72,
       weightKg: 70,
       theme: 'auto',
+      bg: 'crema',
       dailyMilestones: [1000, 5000, 8000, 10000, 15000, 20000],
       weeklyMilestones: [35000, 50000, 70000, 100000],
       totalMilestones: [10000, 50000, 100000, 250000, 500000, 1000000],
@@ -117,6 +118,7 @@
     toby: { name: 'Toby', color: '#D29A66', desc: 'Perrito que nunca se cansa' },
     copo: { name: 'Copo', color: '#FF5C9A', desc: 'Pingüino con bufanda' },
     rex:  { name: 'Rex',  color: '#5FCB72', desc: 'Dino de pasos gigantes' },
+    luna: { name: 'Luna', color: '#FF8FCF', desc: 'Unicornio mágico y brillante' },
   };
   const OUT = '#2A1F3D';
 
@@ -167,6 +169,21 @@
         <path d="M70 90 l5 14" stroke="${color}" stroke-width="7" stroke-linecap="round"/>
         <path d="M30 86 l4 2 M44 91 l4 1 M60 92 l4 -1" stroke="#fff" stroke-width="2" stroke-linecap="round" opacity=".7"/>`;
       mouthOn = party;
+    } else if (avatar === 'luna') {
+      const coat = '#FFF7FD';
+      back = `<path d="M84 32 q18 8 10 26 q14 10 2 26 q-6 -10 -12 -12 q6 -18 0 -40z" fill="${color}" stroke="${OUT}" stroke-width="2.5" stroke-linejoin="round"/>
+        <path d="M90 44 q6 6 2 14 M94 66 q4 6 0 12" stroke="${light}" stroke-width="3" fill="none" stroke-linecap="round"/>
+        <path d="M29 36 L28 12 L46 24 Z" fill="${coat}" stroke="${OUT}" stroke-width="2.5" stroke-linejoin="round"/><path d="M32 29 L32 18 L41 24 Z" fill="#FFC6E3"/>
+        <path d="M83 36 L84 12 L66 24 Z" fill="${coat}" stroke="${OUT}" stroke-width="2.5" stroke-linejoin="round"/><path d="M80 29 L80 18 L71 24 Z" fill="#FFC6E3"/>`;
+      body = `<path d="${B}" fill="${coat}" stroke="${OUT}" stroke-width="2.5"/>
+        <ellipse cx="56" cy="74" rx="17" ry="10" fill="#FFE1F0"/>
+        <path d="M32 44 C35 34 41 29 46 27" stroke="#fff" stroke-width="5" fill="none" stroke-linecap="round"/>`;
+      front = `<path d="M50.5 23 L56 -1 L61.5 23 Z" fill="#FFD66B" stroke="${OUT}" stroke-width="2.3" stroke-linejoin="round"/>
+        <path d="M52.6 17 l6.8 -2.2 M53.8 11 l4.6 -1.6 M55 5.5 l2.2 -0.8" stroke="#E0A000" stroke-width="1.8" stroke-linecap="round"/>
+        <path d="M60 21 q-14 -2 -20 8 q-3 7 2 13 q2 -9 9 -12 q5 7 14 6 q-1 -10 -5 -15z" fill="${color}" stroke="${OUT}" stroke-width="2.3" stroke-linejoin="round"/>
+        <path d="M46 30 q-3 3 -3 7" stroke="${light}" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+        <path d="M90 6 l1.6 3.4 3.4 1.6 -3.4 1.6 -1.6 3.4 -1.6 -3.4 -3.4 -1.6 3.4 -1.6z" fill="#FFD66B"/>
+        <path d="M18 22 l1.1 2.4 2.4 1.1 -2.4 1.1 -1.1 2.4 -1.1 -2.4 -2.4 -1.1 2.4 -1.1z" fill="${color}"/>`;
     } else if (avatar === 'rex') {
       back = `<path d="M24 90 q-22 6 -20 -16 q8 10 22 4z" fill="${color}" stroke="${OUT}" stroke-width="2.5" stroke-linejoin="round"/>
         <path d="M32 32 l4 -16 l10 10z M48 22 l8 -16 l8 16z M66 26 l10 -10 l4 16z" fill="${light}" stroke="${OUT}" stroke-width="2.5" stroke-linejoin="round"/>`;
@@ -795,7 +812,7 @@
     const f = $('.sheet input, .sheet button.btn', root); f && setTimeout(() => f.focus({ preventScroll: true }), 50);
   }
   function escClose(e) { if (e.key === 'Escape') closeSheet(); }
-  function closeSheet() { $('#sheet-root').innerHTML = ''; document.removeEventListener('keydown', escClose); }
+  function closeSheet() { $('#sheet-root').innerHTML = ''; document.removeEventListener('keydown', escClose); applyTheme(); }
 
   function manualSheet(prefill) {
     const p = prefill || {};
@@ -918,7 +935,12 @@
   }
 
   // ================= Ajustes =================
-  const COLORS = ['#FF8A4C', '#B39CFF', '#D29A66', '#FF5C9A', '#5FCB72', '#3BA6FF', '#F5B301', '#19B394'];
+  const COLORS = ['#FF8A4C', '#B39CFF', '#D29A66', '#FF5C9A', '#5FCB72', '#FF8FCF', '#3BA6FF', '#F5B301', '#19B394', '#7DD3FC'];
+  const BACKGROUNDS = [
+    ['crema', 'Crema', '#FFF6EE', '#15111F'], ['cielo', 'Cielo', '#EAF4FF', '#0E1626'], ['menta', 'Menta', '#E9F8F1', '#0D1A16'],
+    ['lavanda', 'Lavanda', '#F2EEFF', '#16122B'], ['rosa', 'Rosa', '#FFEFF5', '#1F1119'], ['limon', 'Limón', '#FFF9DD', '#1A1810'],
+    ['nube', 'Nube', '#F5F5F7', '#121214'],
+  ];
   function avatarPicker(sel, color) {
     return Object.entries(AVATARS).map(([id, a]) => `<button type="button" class="avatar-opt ${id === sel ? 'is-active' : ''}" data-av="${id}" aria-pressed="${id === sel}">
       ${mascotSVG(id === sel ? 'party' : 'happy', id, id === sel ? color : a.color)}<span>${a.name}</span></button>`).join('');
@@ -990,6 +1012,7 @@
 
       <div class="settings-group">
         <h3>🎨 Apariencia</h3>
+        <div class="field"><label>Color de fondo</label><div class="bg-swatches" id="s-bg">${BACKGROUNDS.map(([id, name, l, d]) => `<button type="button" class="bg-swatch ${(c.bg || 'crema') === id ? 'is-active' : ''}" data-bg="${id}" aria-pressed="${(c.bg || 'crema') === id}"><i style="--l:${l};--d:${d}"></i><span>${name}</span></button>`).join('')}</div></div>
         <div class="field"><label>Tema</label><div class="chips" id="s-theme">${[['auto', 'Automático'], ['light', 'Claro'], ['dark', 'Oscuro']].map(([v, l]) => `<button type="button" class="chip ${c.theme === v ? 'is-active' : ''}" data-v="${v}">${l}</button>`).join('')}</div></div>
       </div>
 
@@ -1005,7 +1028,7 @@
       </div>
 
       <div class="sheet__actions"><button class="btn btn--primary" id="s-save">Guardar cambios</button></div>`, sh => {
-      let color = c.mascotColor, avatar = c.avatar, theme = c.theme;
+      let color = c.mascotColor, avatar = c.avatar, theme = c.theme, bg = c.bg || 'crema';
       const redrawAv = () => { $('#s-avatars', sh).innerHTML = avatarPicker(avatar, color); $$('.swatch', sh).forEach(x => x.classList.toggle('is-active', x.dataset.col === color)); };
       const en = $('#s-enable', sh); if (en) en.onclick = () => { closeSheet(); enableCounter(); };
       const bt = $('#s-battery', sh); if (bt) bt.onclick = () => { Native.openBatterySettings(); closeSheet(); setTimeout(() => refreshCounter().then(() => render({ soft: true })), 4000); };
@@ -1031,7 +1054,9 @@
         const av = e.target.closest('[data-av]');
         if (av) { const nm = $('#s-mname', sh); if (!nm.value.trim() || nm.value.trim() === AVATARS[avatar].name) nm.value = AVATARS[av.dataset.av].name; avatar = av.dataset.av; color = AVATARS[avatar].color; redrawAv(); return; }
         const tv = e.target.closest('#s-theme [data-v]');
-        if (tv) { theme = tv.dataset.v; $$('#s-theme .chip', sh).forEach(x => x.classList.toggle('is-active', x === tv)); applyTheme(theme); return; }
+        if (tv) { theme = tv.dataset.v; $$('#s-theme .chip', sh).forEach(x => x.classList.toggle('is-active', x === tv)); applyTheme(theme, bg); return; }
+        const bv = e.target.closest('#s-bg [data-bg]');
+        if (bv) { bg = bv.dataset.bg; $$('#s-bg .bg-swatch', sh).forEach(x => { x.classList.toggle('is-active', x === bv); x.setAttribute('aria-pressed', x === bv); }); applyTheme(theme, bg); return; }
       });
       $('#s-export', sh).onclick = () => {
         const blob = new Blob([JSON.stringify(S, null, 2)], { type: 'application/json' });
@@ -1040,7 +1065,7 @@
       };
       $('#s-import', sh).onchange = async e => {
         const f = e.target.files[0]; if (!f) return;
-        try { const d = JSON.parse(await f.text()); if (!d.days || !d.settings) throw 0; S = { ...defaults(), ...d, settings: { ...defaults().settings, ...d.settings } }; save(); closeSheet(); applyTheme(S.settings.theme); render(); toast('Copia importada ✔'); }
+        try { const d = JSON.parse(await f.text()); if (!d.days || !d.settings) throw 0; S = { ...defaults(), ...d, settings: { ...defaults().settings, ...d.settings } }; save(); closeSheet(); render(); toast('Copia importada ✔'); }
         catch { toast('Ese archivo no parece una copia de Pasito'); }
       };
       $('#s-demo', sh).onclick = () => { closeSheet(); loadDemo(); };
@@ -1056,7 +1081,7 @@
           mascotColor: color, avatar,
           strideCm: clamp(+$('#s-stride', sh).value || 72, 30, 130),
           weightKg: clamp(+$('#s-weight', sh).value || 70, 25, 250),
-          theme, ...ms,
+          theme, bg, ...ms,
         });
         save(); closeSheet(); render(); toast('Ajustes guardados'); checkBadges();
         if (Native) Native.setGoal({ goal: S.settings.dailyGoal }).catch(() => {});
@@ -1064,9 +1089,15 @@
     });
   }
 
-  function applyTheme(t) {
-    if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
-    else delete document.documentElement.dataset.theme;
+  function applyTheme(t = S.settings.theme, bg = S.settings.bg) {
+    const root = document.documentElement;
+    if (t === 'light' || t === 'dark') root.dataset.theme = t;
+    else delete root.dataset.theme;
+    if (bg && bg !== 'crema') root.dataset.bg = bg; else delete root.dataset.bg;
+    // color de la barra del navegador / sistema
+    const b = BACKGROUNDS.find(x => x[0] === (bg || 'crema')) || BACKGROUNDS[0];
+    const dark = t === 'dark' || (t !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+    $$('meta[name="theme-color"]').forEach(m => m.setAttribute('content', dark ? b[3] : b[2]));
   }
 
   // ================= Bienvenida =================
@@ -1180,7 +1211,7 @@
   // ================= Arranque =================
   $$('.tab').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));
   $('#btn-settings').addEventListener('click', () => refreshCounter().finally(settingsSheet));
-  applyTheme(S.settings.theme);
+  applyTheme();
   const h0 = location.hash.slice(1);
   setTab(views[h0] ? h0 : 'hoy');
   if (!S.settings.onboarded) onboarding();
